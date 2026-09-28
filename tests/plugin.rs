@@ -4,6 +4,7 @@
 
 use bevy::ecs::schedule::{LogLevel, ScheduleBuildSettings, ScheduleLabel};
 use bevy::prelude::*;
+use bevy_voice_chat::codec::ImaAdpcm;
 use bevy_voice_chat::prelude::*;
 use bevy_voice_chat::{Sessions, VoiceRuntime};
 use std::sync::Arc;
@@ -53,7 +54,10 @@ fn no_audio_devices_is_an_observable_state_never_a_panic() {
     assert!(sessions.mic().is_some() && sessions.output_failed());
     assert_eq!((sessions.mic_latency_ms(), sessions.output_latency_ms()), (None, None));
     let rt = app.world().resource::<VoiceRuntime>();
-    assert_eq!(rt.codec().bitrate(), 65_600, "IMA-ADPCM by default");
+    let send = rt.send_codec().map(|c| (c.id(), c.bitrate()));
+    assert_eq!(send, Some((ImaAdpcm::ID, 65_600)), "IMA-ADPCM by default, in every build");
+    assert_eq!(rt.codec_error(), None);
+    assert_eq!((state.send_codec, &state.codec_error), (VoiceCodecChoice::ImaAdpcm, &None));
     assert!(rt.mixer().keys().is_empty());
     assert_eq!(rt.output_queued(sessions), 0);
 }

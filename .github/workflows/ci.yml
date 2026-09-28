@@ -31,6 +31,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --all-targets --features opus -- -D warnings
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
@@ -49,7 +50,8 @@ jobs:
       # Tests use fake audio devices: no sound card is needed.
       - run: cargo test --all-features
       - run: cargo test
-      - run: cargo build --no-default-features
+      - run: cargo test --features opus
+      - run: cargo test --no-default-features
       - run: cargo build --examples --all-features
 
   doc:

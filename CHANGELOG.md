@@ -6,7 +6,64 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (before 1.0, a breaking
 change or a Bevy / key dependency bump raises the minor version).
 
-## [0.1.0] - Unreleased
+## [0.2.0] - 2026-09-28
+
+Opus as an optional second codec, for Bevy 0.19.0, cpal 0.17.3 and opus-rs 0.1.34.
+
+### Added
+
+- Feature `opus` (off by default): Opus (SILK wideband, 20 ms, mono) through the pure-Rust
+  `opus-rs` 0.1.34 as the low-bandwidth codec: 60 B per frame at the default 24 kbps (constant
+  bitrate, complexity 5; presets 16 and 32 kbps) instead of 164 B, with Opus packet loss
+  concealment. Every call into the library runs inside `catch_unwind`, and incoming packets are
+  header-checked before it sees them.
+- `VoiceChatConfig::{codec, opus}` (`VoiceCodecChoice::{ImaAdpcm, Opus}`, `OpusSettings { bitrate_bps,
+  complexity, vbr }` with `problems()`, `frame_bytes()`, `LOW_BANDWIDTH` / `QUALITY` presets). An
+  old config file without these fields still loads (IMA-ADPCM).
+- Runtime codec change: editing `codec` / `opus` rebuilds the encoder for the next frame sent.
+- Mixed-codec receive: every codec compiled in is decoded, by the packet's codec id; a build
+  without `opus` drops Opus packets and counts them (`VoiceStats::unsupported`, one warning).
+- No automatic fallback: `VoiceChatConfig::problems()` reports invalid Opus settings and
+  `codec: Opus` without the feature; an encoder that cannot start (or keeps failing) turns
+  sending off with `VoiceChatState::codec_error` / `VoiceRuntime::codec_error()`.
+- `VoiceChatState::{send_codec, codec_error}`, `VoiceStats::{unsupported, encode_errors}`,
+  `JitterStats::undecodable`.
+- `codec::{OPUS_ID, Opus (feature), new_encoder, new_decoder, can_decode}`, `CodecError::{NotCompiled,
+  BadSettings, Backend, Panicked}` (+ `Display`), `ImaAdpcm::{FRAME_BYTES, MAX_STEP_INDEX}`,
+  `Pcm16::FRAME_BYTES`.
+- `packet::{validate_packet, opus_toc_ok}`, `Reject::Malformed`.
+- `jitter::{JitterCore, Next}` (the jitter state machine over any payload, with a restart
+  `generation()`), `mixer::{Payload, PacketJitter}`, `Mixer::insert_packet`,
+  `SpeakerChannel::decoder_codec()`: stateful codecs are decoded at playout, in sequence order.
+- `mic_test` example: `--opus`, `--kbps N`, `--cycle` (runtime codec switching), `--clean`.
+
+### Changed (breaking)
+
+- The `VoiceCodec` trait: `encode` returns `Result`, `decode` takes `&mut self`,
+  `max_frame_bytes()` / `fixed_frame_bytes()` replace `frame_bytes()`, `bitrate()` is required,
+  new `is_stateful()` / `conceal()` / `reset()` (with defaults).
+- `VoiceRuntime::codec()` is now `send_codec() -> Option<&dyn VoiceCodec>` (`None` = sending is
+  off).
+- `replicon::check_up(speaker, &up)` (no `want_codec` / `want_len`); relays accept every known
+  wire codec (`validate_packet`), not only their own.
+- `SpeakerChannel::jitter` is a `PacketJitter`; `Mixer` and `SpeakerChannel` are no longer
+  `Clone` (`Debug` is kept).
+- New fields on `VoiceChatConfig`, `VoiceChatState`, `VoiceStats`, `JitterStats` (struct literals
+  need them or `..Default::default()`); new `Reject` variant.
+- `Pcm16` is documented as a local reference codec; it is never accepted on the wire.
+
+### Unchanged
+
+- IMA-ADPCM stays the default codec and its wire format is identical, so a default 0.2 peer and
+  a 0.1 peer hear each other. Its receive path (decode on arrival, repeat-and-fade concealment)
+  is sample-identical to 0.1.
+
+### Internal
+
+- CI also runs `cargo test --features opus`, `cargo test --no-default-features` and clippy with
+  `--features opus`. `Cargo.lock` keeps every Bevy crate at 0.19.0.
+
+## [0.1.0] - 2026-09-27
 
 First release, for Bevy 0.19.0 and cpal 0.17.3.
 

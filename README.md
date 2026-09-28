@@ -1,15 +1,19 @@
 # bevy_voice_chat
 
+[![crates.io](https://img.shields.io/crates/v/bevy_voice_chat.svg)](https://crates.io/crates/bevy_voice_chat)
+[![docs.rs](https://img.shields.io/docsrs/bevy_voice_chat)](https://docs.rs/bevy_voice_chat)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![CI](https://github.com/warmar94/bevy_voice_chat/actions/workflows/ci.yml/badge.svg)](https://github.com/warmar94/bevy_voice_chat/actions/workflows/ci.yml)
 [![Bevy 0.19.0](https://img.shields.io/badge/Bevy-0.19.0-informational)](https://bevyengine.org)
 [![cpal 0.17.3](https://img.shields.io/badge/cpal-0.17.3-informational)](https://crates.io/crates/cpal)
 [![bevy_replicon 0.44.2 (optional)](https://img.shields.io/badge/bevy__replicon-0.44.2%20(optional)-informational)](https://crates.io/crates/bevy_replicon)
+[![opus-rs 0.1.34 (optional)](https://img.shields.io/badge/opus--rs-0.1.34%20(optional)-informational)](https://crates.io/crates/opus-rs)
 
 Game-agnostic, transport-agnostic **voice chat for [Bevy](https://bevyengine.org)**: microphone
-capture, voice activity or push-to-talk, filter hooks (voice changers, radio effects), a pure-Rust
-codec, per-speaker jitter buffers and a mixer that plays every voice by distance (with left/right
-pan) or globally, on the output device the player picked.
+capture, voice activity or push-to-talk, filter hooks (voice changers, radio effects), pure-Rust
+codecs (IMA-ADPCM built in, Opus optional), per-speaker jitter buffers and a mixer that plays
+every voice by distance (with left/right pan) or globally, on the output device the player
+picked.
 
 The crate **never touches the network**: encoded 20 ms frames come out as a message, you send them
 with whatever networking you already use, and you feed received frames back in as a message. A
@@ -33,6 +37,7 @@ the `replicon` feature.
   - [10. Stats and diagnostics](#10-stats-and-diagnostics)
   - [11. The replicon transport (feature `replicon`)](#11-the-replicon-transport-feature-replicon)
   - [12. System order](#12-system-order)
+  - [13. Choosing a codec (ADPCM or Opus)](#13-choosing-a-codec-adpcm-or-opus)
 - [How it works](#how-it-works)
 - [API reference](#api-reference)
 - [Cargo features](#cargo-features)
@@ -57,19 +62,24 @@ the `replicon` feature.
   rolloff and pan, per-speaker range overrides, or everyone at full volume.
 - **Its own output stream on a chosen device** (Bevy's audio cannot pick a device), device lists,
   a live mic level for a meter, a loopback mic test, a WAV file as a stand-in microphone.
-- **Pure Rust**: IMA-ADPCM codec (~66 kbps per talking speaker), no native library to ship.
+- **Pure Rust, no native library to ship**: IMA-ADPCM (~66 kbps per talking speaker, the
+  default, zero extra dependencies, near-zero CPU) or, with the `opus` feature, Opus (24 kbps by
+  default: about 2.5x less bandwidth for bigger lobbies and weak uploads). Receivers play both, so
+  players on different codecs hear each other, and the codec can be changed at runtime.
 - **Fail closed, never panic**: no microphone, an unplugged headset or a driver error becomes an
   observable state; audio threads only touch atomics and bounded channels.
 - **Tested without hardware**: every device goes through a trait, the tests use fakes.
 
 ## Quick start
 
-Add the crate (it is not on crates.io yet; depend on the repository):
+Add the crate:
 
 ```toml
 [dependencies]
 bevy = "0.19.0"
-bevy_voice_chat = { git = "https://github.com/warmar94/bevy_voice_chat" }
+bevy_voice_chat = "0.2"
+# or, with the optional low-bandwidth Opus codec:
+# bevy_voice_chat = { version = "0.2", features = ["opus"] }
 ```
 
 An open-mic voice chat whose "network" is an echo: every frame you send comes straight back as
@@ -137,6 +147,10 @@ use bevy_voice_chat::prelude::*;
 
 let config: VoiceChatConfig = ron::from_str("(hearing: Global, jitter_target_ms: 80.0)").expect("valid");
 assert_eq!(config.hearing, Hearing::Global);
+
+// The codec and its settings (a partial `opus` block keeps the other defaults).
+let opus: VoiceChatConfig = ron::from_str("(codec: Opus, opus: (bitrate_bps: 32000))").expect("valid");
+assert_eq!((opus.codec, opus.opus.bitrate_bps, opus.opus.complexity), (VoiceCodecChoice::Opus, 32_000, 5));
 ```
 
 | field | default | meaning |
@@ -156,8 +170,13 @@ assert_eq!(config.hearing, Hearing::Global);
 | `mic_backlog_frames` | `5` | captured frames processed per game frame; older ones (a stall) are dropped |
 | `speaker_timeout_secs` | `5.0` | a silent speaker's buffer is forgotten after this |
 | `heard_hold_ms` | `250.0` | `VoiceActivity`: a speaker counts as heard this long after its last frame |
+| `codec` | `ImaAdpcm` | what this player sends with; `Opus` needs the `opus` feature ([section 13](#13-choosing-a-codec-adpcm-or-opus)) |
+| `opus.bitrate_bps` | `24000` | Opus bitrate, `6000..=64000` (16000 = low bandwidth, 32000 = quality) |
+| `opus.complexity` | `5` | Opus encoder effort `0..=10` (CPU per frame) |
+| `opus.vbr` | `false` | `false` = constant bitrate, `true` = variable, capped at the bitrate |
 
-`VoiceChatConfig::problems()` lists every invalid value (empty = fine).
+`VoiceChatConfig::problems()` lists every invalid value (empty = fine), including invalid Opus
+settings and `codec: Opus` in a build without the `opus` feature.
 
 ### 2. Turn voice on
 
@@ -256,24 +275,25 @@ fn main() {
 }
 ```
 
-Both messages are `Serialize + Deserialize`. With the default codec one frame is 164 bytes of
-payload; a whole `OutgoingVoice` is at most ~177 bytes in a compact format such as postcard.
+Both messages are `Serialize + Deserialize`. With the default codec (IMA-ADPCM) one frame is 164
+bytes of payload and a whole `OutgoingVoice` is at most ~177 bytes in a compact format such as
+postcard; with Opus at its default 24 kbps a frame is 60 bytes (~73 bytes per message).
 
 **Relaying through a host or server?** Check each packet before passing it on: the sender must be
-known, the frame must be exactly one frame of this build's codec, and each speaker gets a packet
-budget (a talking player sends 50 per second):
+known, the frame must be a well-formed frame of a known codec (`validate_packet` knows IMA-ADPCM
+and Opus, and needs no decoder, so a relay built without the `opus` feature still forwards Opus),
+and each speaker gets a packet budget (a talking player sends 50 per second):
 
 ```rust
-use bevy_voice_chat::packet::{validate_frame, TokenBucket};
-use bevy_voice_chat::VoiceRuntime;
+use bevy_voice_chat::packet::{validate_packet, TokenBucket};
 
 /// `bucket` is this speaker's; call `bucket.refill(delta_seconds)` once per frame.
-fn accept(runtime: &VoiceRuntime, bucket: &mut TokenBucket, codec: u8, frame: &[u8]) -> bool {
-    let c = runtime.codec();
-    validate_frame(codec, frame.len(), c.id(), c.frame_bytes()).is_ok() && bucket.take()
+fn accept(bucket: &mut TokenBucket, codec: u8, frame: &[u8]) -> bool {
+    validate_packet(codec, frame).is_ok() && bucket.take()
 }
 
 let mut bucket = TokenBucket::new(75.0, 15.0); // 75 packets/s, bursts of 15
+assert!(!accept(&mut bucket, 1, &[0; 10]), "not one IMA-ADPCM frame");
 ```
 
 ### 5. Positional voice: speakers and the listener
@@ -376,13 +396,18 @@ fn audio_settings(devices: Res<VoiceDevices>, state: Res<VoiceChatState>, mut in
         DeviceState::Live(name) => { let _ = name; }
         DeviceState::Failed => { /* "No microphone found" */ }
     }
+    // Your voice cannot be sent (e.g. `codec: Opus` in a build without the `opus` feature).
+    if let Some(reason) = &state.codec_error {
+        let _ = reason; // show it: "Voice chat: {reason}"
+    }
 }
 ```
 
 In push-to-talk mode a menu usually cannot hold the talk key; set `talk_held = true` while the mic
 test runs so the player hears everything. `VoiceChatState` also reports the output device
 (`output`), the microphone's native format (`mic_format`), the output rate (`output_rate`) and what
-the microphone is (`mic_kind`, e.g. a WAV file).
+the microphone is (`mic_kind`, e.g. a WAV file), plus the codec you send with (`send_codec`) and,
+when your voice cannot be sent, why (`codec_error`).
 
 ### 8. Filters
 
@@ -528,11 +553,13 @@ use bevy_voice_chat::{Sessions, VoiceRuntime};
 fn voice_debug_line(stats: Res<VoiceStats>, runtime: Res<VoiceRuntime>, sessions: Res<Sessions>) {
     let (jitter, depth) = runtime.mixer().totals();
     info!(
-        "voice: out {} pkt / {} B, in {} pkt, rejected {}, played {}, lost {}, late {}, buffered {} frames, output queue {} frames, underruns {}, mic latency {:?} ms, codec {} ({} bps)",
+        "voice: out {} pkt / {} B, in {} pkt, rejected {}, unsupported {}, encode errors {}, played {}, lost {}, late {}, buffered {} frames, output queue {} frames, underruns {}, mic latency {:?} ms, sending with {:?}",
         stats.packets_out,
         stats.bytes_out,
         stats.packets_in,
         stats.rejected,
+        stats.unsupported,
+        stats.encode_errors,
         jitter.played,
         jitter.lost,
         jitter.late,
@@ -540,29 +567,32 @@ fn voice_debug_line(stats: Res<VoiceStats>, runtime: Res<VoiceRuntime>, sessions
         runtime.output_queued(&sessions),
         stats.underruns,
         sessions.mic_latency_ms(),
-        runtime.codec().name(),
-        runtime.codec().bitrate(),
+        // None = sending is off; `runtime.codec_error()` says why.
+        runtime.send_codec().map(|c| (c.name(), c.bitrate())),
     );
 }
 ```
 
-`VoiceStats` counts packets and bytes out, packets in, rejected packets, mic-test frames, mixed
-frames, output underruns and stale microphone frames. Per speaker, `runtime.mixer().channel(key)`
-gives the jitter buffer (`stats`, `depth()`) and `latency_ms` (sender clock to mixed; meaningful
-when both run on one machine).
+`VoiceStats` counts packets and bytes out, packets in, rejected packets, packets of a codec this
+build cannot decode (`unsupported`), frames the encoder failed on (`encode_errors`), mic-test
+frames, mixed frames, output underruns and stale microphone frames. Per speaker,
+`runtime.mixer().channel(key)` gives the jitter buffer (`stats`, `depth()`), the codec it last
+played (`decoder_codec()`) and `latency_ms` (sender clock to mixed; meaningful when both run on
+one machine).
 
 ### 11. The replicon transport (feature `replicon`)
 
 ```toml
 [dependencies]
-bevy_voice_chat = { git = "https://github.com/warmar94/bevy_voice_chat", features = ["replicon"] }
+bevy_voice_chat = { version = "0.2", features = ["replicon"] }
 ```
 
 `VoiceRepliconPlugin` sends your frames as a client message (`VoiceUp`) on replicon's unreliable
-channel. The server checks each one (a known sender, the codec and exact size, your
-`VoiceRelayHook`, a per-speaker budget) and relays it as a server message (`VoiceDown`) to everyone
-except the speaker, the listen-server host included, where it becomes `IncomingVoice`. The host's
-own voice takes the same path.
+channel. The server checks each one (a known sender, a well-formed frame of any known codec with
+`validate_packet`, your `VoiceRelayHook`, a per-speaker budget) and relays it as a server message
+(`VoiceDown`) to everyone except the speaker, the listen-server host included, where it becomes
+`IncomingVoice`. The host's own voice takes the same path. The relay never decodes, so a host
+built without the `opus` feature still relays Opus between players who have it.
 
 You say who is who: put `VoiceSenderId` on each client's connection entity on the server (the
 entity with replicon's `ConnectedClient`) and set `HostVoiceSpeaker` for a listen server's own
@@ -613,6 +643,73 @@ VoiceChatSystems::Devices  ->  VoiceChatSystems::Capture  ->  VoiceChatSystems::
 
 The replicon transport runs in `VoiceTransportSystems`, between `Capture` and `Playback`.
 
+### 13. Choosing a codec (ADPCM or Opus)
+
+IMA-ADPCM is the default and always built in. Opus is the optional **low-bandwidth** codec: turn
+on the `opus` cargo feature, then choose it in the config.
+
+```toml
+[dependencies]
+bevy_voice_chat = { version = "0.2", features = ["opus"] }
+```
+
+```rust
+use bevy::prelude::*;
+use bevy_voice_chat::prelude::*;
+
+fn main() {
+    // `OpusSettings::LOW_BANDWIDTH` (16 kbps) and `OpusSettings::QUALITY` (32 kbps) are presets.
+    let config = VoiceChatConfig { codec: VoiceCodecChoice::Opus, opus: OpusSettings { bitrate_bps: 24_000, ..Default::default() }, ..Default::default() };
+    // Without the `opus` feature this lists "codec: Opus needs the `opus` cargo feature".
+    for problem in config.problems() {
+        warn!("voice config: {problem}");
+    }
+    let mut app = App::new();
+    app.add_plugins((MinimalPlugins, VoiceChatPlugin { config }));
+}
+
+/// A settings screen can switch at runtime: the next frame you send uses the new codec.
+fn use_low_bandwidth_voice(mut config: ResMut<VoiceChatConfig>) {
+    config.codec = VoiceCodecChoice::Opus;
+    config.opus = OpusSettings::LOW_BANDWIDTH;
+}
+```
+
+| | IMA-ADPCM (default) | Opus 16 kbps | **Opus 24 kbps (default)** | Opus 32 kbps |
+|---|---|---|---|---|
+| bytes per 20 ms frame | 164 | 40 | 60 | 80 |
+| payload per talking player | 65.6 kbps | 16 kbps | 24 kbps | 32 kbps |
+| roughly on the wire (+ UDP and transport headers, estimated) | ~86 kbps | ~36 kbps | ~44 kbps | ~52 kbps |
+| speech quality, objective proxy (lower = better) | 1.33 dB | 2.27 dB (measured at complexity 9) | 1.62 dB | 1.08 dB (complexity 9) |
+| encode per frame (desktop CPU, release, complexity 5) | ~4 us | ~200 us | ~200 us | ~200 us |
+| decode per frame, per speaker | ~1 us | ~7-10 us | ~7-10 us | ~7-10 us |
+| codec memory per remote speaker | none (stateless) | ~173 KB | ~173 KB | ~173 KB |
+| a lost packet | the last frame repeated at half level | Opus packet loss concealment | same | same |
+| extra dependencies | none | `opus-rs` (pure Rust, no dependencies of its own) | same | same |
+
+The quality row is a rough objective measure (log-spectral distance against the original, on a
+real speech recording), not a listening test: at the default 24 kbps Opus is close to IMA-ADPCM
+(slightly behind on this measure) for about 2.5x less bandwidth, and 32 kbps scored better than
+IMA-ADPCM (measured at complexity 9; expect a little less at the default 5) while still using
+about half the bandwidth. 16 kbps trades more quality for the smallest packets. Judge by ear
+with the `mic_test` example ([Examples](#examples)).
+
+How codecs behave together:
+
+- **Receivers decode every codec compiled into them**, by the codec id in each packet, so a player
+  on Opus and a player on IMA-ADPCM hear each other. A build **without** the `opus` feature drops
+  Opus packets and counts them in `VoiceStats::unsupported` (with one warning in the log).
+- **No automatic fallback.** If the chosen codec cannot run (`codec: Opus` without the feature,
+  invalid `opus` settings, or an encoder that keeps failing), your voice is **not sent** and
+  `VoiceChatState::codec_error` (also `VoiceRuntime::codec_error()`) says why; receiving keeps
+  working. Check `VoiceChatConfig::problems()` up front. The crate never switches to another codec
+  on its own.
+- **Runtime change:** edit `VoiceChatConfig::codec` or `opus` and the next frame sent uses it (the
+  encoder is rebuilt once, ~0.25 ms). Receivers switch per speaker as the packets change.
+- **Relays** (`validate_packet`, the replicon transport) forward Opus even without the feature.
+- IMA-ADPCM frames are decoded when they arrive; Opus frames are buffered encoded and decoded in
+  order when they play (Opus decoding carries state from frame to frame).
+
 ## How it works
 
 **Speaker side.** The capture thread converts the device's samples to f32, downmixes to mono,
@@ -623,11 +720,14 @@ speech), applies `mic_gain`, runs the gate (voice activity or push-to-talk), the
 and encodes. Frames go out as `OutgoingVoice`, or in mic-test mode straight into this player's own
 jitter buffer.
 
-**Listener side.** `IncomingVoice` is validated, decoded and put in that speaker's **jitter
-buffer**: it waits for `jitter_target_ms` before a talk spurt, plays in sequence order, drops late
-and duplicate frames, conceals a lost frame (the previous one at half level), waits on an underflow
-(a frame arriving a little late still plays), fades the end of a spurt, trims one frame when the
-depth stayed above target for a second, and never holds more than `jitter_max_ms`.
+**Listener side.** `IncomingVoice` is validated (`validate_packet`) and put in that speaker's
+**jitter buffer**: IMA-ADPCM frames are decoded on arrival (each one stands alone); Opus frames
+are stored encoded and decoded in sequence order when they play, by that speaker's own decoder.
+The buffer waits for `jitter_target_ms` before a talk spurt, plays in sequence order, drops late
+and duplicate frames, conceals a lost frame (IMA-ADPCM: the previous one at half level; Opus: its
+own packet loss concealment), waits on an underflow (a frame arriving a little late still plays),
+fades the end of a spurt, trims one frame when the depth stayed above target for a second, and
+never holds more than `jitter_max_ms`. A speaker who switches codec gets a fresh decoder.
 
 **Mixing** runs on the output device's clock: the app keeps `output_queue_ms` of mixed 16 kHz stereo
 queued ahead of the device; each mixed frame pulls every speaker, runs the incoming filters,
@@ -650,15 +750,15 @@ The full documentation is generated with `cargo doc --open --all-features`. Ever
 | `VoiceChatSystems::{Devices, Capture, Playback}` | system sets | `my_system.before(VoiceChatSystems::Devices)` |
 | `VoiceInput` | resource (you write) | `input.enabled = true;` ([fields](#2-turn-voice-on)) |
 | `TalkMode::{VoiceActivity, PushToTalk}` | enum | `input.mode = TalkMode::PushToTalk;` |
-| `VoiceChatConfig` | resource (you write) | `config.range = 30.0;` ([fields](#1-add-the-plugin-and-tune-it)) |
+| `VoiceChatConfig` | resource (you write) | `config.range = 30.0;` ([fields](#1-add-the-plugin-and-tune-it)); `config.codec = VoiceCodecChoice::Opus;` |
 | `VoiceChatConfig::problems()` | fn | `assert!(cfg.problems().is_empty())` |
 | `VoiceChatConfig::jitter()` / `spatial()` / `output_queue_frames()` | fn | the derived `JitterConfig`, `SpatialParams`, queue depth in frames |
 | `RescanDevices` | message (you write) | `rescan.write(RescanDevices);` |
 | `VoiceDevices { scanned, inputs, outputs }` | resource (read) | `for name in &devices.inputs { .. }` |
 | `DeviceState::{Closed, Opening, Live(name), Failed}` | enum | `state.mic == DeviceState::Failed` |
-| `VoiceChatState { mic, output, mic_level, transmitting, mic_format, output_rate, mic_kind }` | resource (read) | `meter.set(state.mic_level)` |
+| `VoiceChatState { mic, output, mic_level, transmitting, mic_format, output_rate, mic_kind, send_codec, codec_error }` | resource (read) | `meter.set(state.mic_level)`; `if let Some(why) = &state.codec_error { .. }` |
 | `VoiceActivity { heard, transmitting }` | resource (read) | `activity.heard.contains(&SpeakerId(2))` |
-| `VoiceStats { packets_out, bytes_out, packets_in, rejected, loopback, mixed, underruns, mic_dropped }` | resource (read) | `stats.packets_out` |
+| `VoiceStats { packets_out, bytes_out, packets_in, rejected, unsupported, encode_errors, loopback, mixed, underruns, mic_dropped }` | resource (read) | `stats.packets_out` |
 | `SpeakerId(u64)` | id | `SpeakerId(player_id)` |
 | `OutgoingVoice { seq, ts, codec, frame }` | message (you read) | `for f in outgoing.read() { net.send(f) }` |
 | `IncomingVoice { speaker, seq, ts, codec, frame }` | message (you write) | `incoming.write(IncomingVoice { speaker, .. })` |
@@ -666,7 +766,7 @@ The full documentation is generated with `cargo doc --open --all-features`. Ever
 | `VoiceListener { right_from }` | component | `VoiceListener { right_from: Some(camera) }` |
 | `VoiceIo(Arc<dyn AudioIo>)` | resource | `VoiceIo(Arc::new(NullIo))` |
 | `Sessions` | resource (read) | `sessions.mic()`, `output()`, `mic_latency_ms()`, `output_latency_ms()`, `output_failed()` |
-| `VoiceRuntime` | resource (read) | `runtime.codec()`, `mixer()`, `output_queued(&sessions)`; `VoiceRuntime::new(&config)` |
+| `VoiceRuntime` | resource (read) | `runtime.send_codec()` (`None` = sending is off), `codec_error()`, `mixer()`, `output_queued(&sessions)`; `VoiceRuntime::new(&config)` |
 | `wall_ms()` | fn | the wall clock in ms (wrapping `u32`), what `OutgoingVoice::ts` carries |
 | `prelude` | module | `use bevy_voice_chat::prelude::*;` |
 
@@ -676,12 +776,18 @@ The full documentation is generated with `cargo doc --open --all-features`. Ever
 |---|---|
 | `VOICE_RATE` (16 000), `FRAME` (320), `FRAME_MS` (20) | the wire format: 20 ms of 16 kHz mono per frame |
 | `MAX_VOICE_BYTES` (700) | no accepted packet is larger |
+| `OPUS_ID` (3) | the wire id of Opus packets (defined in every build) |
 | `MonoFrame` | `[f32; FRAME]` |
-| `VoiceCodec` trait | `id()`, `name()`, `frame_bytes()`, `encode(&pcm, &mut out)`, `decode(&bytes, &mut pcm)`, `bitrate()` |
-| `ImaAdpcm` (`ID` = 1) | the default: 164 bytes per frame, 65.6 kbps; `ImaAdpcm::default().encode(&frame, &mut bytes)` |
-| `Pcm16` (`ID` = 2) | the reference codec: 640 bytes per frame, 256 kbps |
-| `CodecError::{WrongLength { got, want }, BadHeader}` | a malformed packet |
-| `default_codec()` | `Box<dyn VoiceCodec>` this build speaks |
+| `VoiceCodecChoice::{ImaAdpcm, Opus}` | what this player sends with (`config.codec`); in the prelude |
+| `OpusSettings { bitrate_bps, complexity, vbr }` | `config.opus`; `problems()`, `frame_bytes()`, presets `LOW_BANDWIDTH` / `QUALITY`, limits `MIN_BITRATE` / `MAX_BITRATE` / `MAX_COMPLEXITY`; in the prelude |
+| `VoiceCodec` trait | `id()`, `name()`, `max_frame_bytes()`, `fixed_frame_bytes()`, `bitrate()`, `encode(&pcm, &mut out) -> Result`, `decode(&bytes, &mut pcm) -> Result` (takes `&mut self`), `is_stateful()`, `conceal(next, &mut pcm) -> bool`, `reset()` |
+| `ImaAdpcm` (`ID` = 1, `FRAME_BYTES` = 164, `MAX_STEP_INDEX` = 88) | the default: 65.6 kbps; `ImaAdpcm::default().encode(&frame, &mut bytes)?` |
+| `Opus` (`ID` = 3; feature `opus`) | `Opus::encoder(settings)?`, `Opus::decoder()?`, `settings()`; SILK wideband via `opus-rs` |
+| `Pcm16` (`ID` = 2, `FRAME_BYTES` = 640) | a local reference codec (256 kbps), never accepted on the wire |
+| `CodecError::{WrongLength { got, want }, BadHeader, NotCompiled, BadSettings(_), Backend(_), Panicked}` | a malformed packet or a codec that cannot run (`Display`) |
+| `new_encoder(choice, &opus)` | `Result<Box<dyn VoiceCodec>, CodecError>`: never falls back to another codec |
+| `new_decoder(id)` / `can_decode(id)` | a decoder for a wire id this build decodes / whether it does |
+| `default_codec()` | `Box<dyn VoiceCodec>`: the default sending codec (IMA-ADPCM) |
 | `to_i16(x)` / `from_i16(v)` | sample conversions (NaN -> 0) |
 
 ### `filter`
@@ -736,8 +842,10 @@ The full documentation is generated with `cargo doc --open --all-features`. Ever
 
 | item | what / example |
 |---|---|
-| `validate_frame(codec, len, want_codec, want_len)` | `validate_frame(1, 164, 1, 164) == Ok(())` |
-| `Reject::{UnknownSender, WrongCodec, BadSize, RateLimited}` | why a packet was dropped |
+| `validate_packet(codec, &frame)` | THE check for every wire codec: `validate_packet(1, &[0; 164]) == Ok(())` |
+| `opus_toc_ok(&frame)` | an Opus packet this crate accepts (SILK, 20 ms, mono, one frame) |
+| `validate_frame(codec, len, want_codec, want_len)` | an exact-size check for a fixed-size codec: `validate_frame(1, 164, 1, 164) == Ok(())` |
+| `Reject::{UnknownSender, WrongCodec, BadSize, Malformed, RateLimited}` | why a packet was dropped |
 | `TokenBucket` | `TokenBucket::new(rate, burst)`, `refill(dt)`, `take() -> bool` |
 
 ### `jitter`, `mixer`, `gate`, `dsp` (building blocks, usable on their own)
@@ -745,11 +853,14 @@ The full documentation is generated with `cargo doc --open --all-features`. Ever
 | item | what / example |
 |---|---|
 | `jitter::JitterBuffer` | `new(cfg)`, `insert(seq, &frame, ts) -> Insert`, `pull(&mut out) -> Pull`, `depth()`, `is_playing()`, `is_idle()`, `stats` |
+| `jitter::JitterCore<P>` | the same state machine over any payload: `insert(seq, payload, ts)`, `next_frame() -> Next`, `generation()` (bumped by a sender restart), `depth()`, `is_playing()`, `is_idle()`, `stats` |
+| `jitter::Next::{Play { payload, ts }, Tail, Conceal { run, next }, Silent}` | what one `JitterCore::next_frame()` asks for |
 | `jitter::JitterConfig { target, max, conceal_max }` | sizes in frames (`config.jitter()`) |
-| `jitter::Pull::{Played { ts }, Concealed, Silent}`, `jitter::Insert::{Stored, Late, Duplicate}`, `jitter::JitterStats` | results and counters |
-| `mixer::Mixer` | `new`, `set_config`, `insert`, `set_target`, `keys`, `channel`, `any_active`, `mix`, `heard`, `forget_idle`, `remove`, `clear`, `totals` |
+| `jitter::Pull::{Played { ts }, Concealed, Silent}`, `jitter::Insert::{Stored, Late, Duplicate}`, `jitter::JitterStats` (incl. `undecodable`) | results and counters |
+| `mixer::Mixer` | `new`, `set_config`, `insert` (a decoded frame), `insert_packet` (an encoded packet, decoded at playout), `set_target`, `keys`, `channel`, `any_active`, `mix`, `heard`, `forget_idle`, `remove`, `clear`, `totals` |
+| `mixer::Payload::{Pcm(frame), Encoded { codec, bytes }}`, `mixer::PacketJitter` | a buffered frame; `JitterCore<Payload>` |
 | `mixer::SpeakerKey::{Remote(SpeakerId), Loopback}` | a mixer channel (`Loopback` = the mic test) |
-| `mixer::SpeakerChannel { jitter, latency_ms, .. }` | one speaker's channel |
+| `mixer::SpeakerChannel { jitter, latency_ms, .. }` | one speaker's channel; `decoder_codec()` |
 | `mixer::StereoFrame` | `[f32; FRAME * 2]`, interleaved L R |
 | `gate::TalkGate` | `TalkGate::new(hangover_frames, release_frames).step(GateInput::PushToTalk { held: true })` |
 | `gate::GateInput::{OpenMic { level, threshold }, PushToTalk { held }}` | one frame's gate input |
@@ -770,24 +881,31 @@ The full documentation is generated with `cargo doc --open --all-features`. Ever
 | `VoiceSenderId(SpeakerId)` | component on a client's connection entity (server) |
 | `HostVoiceSpeaker(Option<SpeakerId>)` | resource: a listen server's own speaker id |
 | `VoiceRelayHook` | resource: `VoiceRelayHook::new(\|speaker, packet\| true)` |
-| `VoiceRelayStats { relayed, unknown_sender, invalid, rate_limited, refused }` | resource (server) |
+| `VoiceRelayStats { relayed, unknown_sender, invalid, rate_limited, refused }` | resource (server); `invalid` = unknown codec, bad size or malformed |
 | `VoiceTransportSystems` | system set between `Capture` and `Playback` |
-| `check_up(speaker, &up, want_codec, want_len)` | the relay's first check, for a custom relay |
+| `check_up(speaker, &up)` | the relay's first check (a known sender + `validate_packet`), for a custom relay |
 
 ## Cargo features
 
 | feature | default | what it adds |
 |---|---|---|
+| `opus` | no | the Opus codec ([section 13](#13-choosing-a-codec-adpcm-or-opus)) via `opus-rs` 0.1.34: pure Rust, no build script, no dependencies of its own, BSD-3-Clause (see [License](#license)) |
 | `replicon` | no | `VoiceRepliconPlugin` over `bevy_replicon` 0.44.2 (+ `bevy_state` for its run conditions) |
 
 Without features the crate depends on Bevy's `bevy_app`, `bevy_ecs`, `bevy_math`, `bevy_time`,
-`bevy_transform` (all without default features), `cpal`, `serde` and `tracing`.
+`bevy_transform` (all without default features), `cpal`, `serde` and `tracing`. Without `opus`
+the crate still understands Opus on the wire (validation, relaying, config), it just cannot
+encode or play it.
 
 ## Compatibility
 
-| bevy_voice_chat | Bevy | cpal | bevy_replicon (optional) | Rust |
-|---|---|---|---|---|
-| 0.1 | 0.19.0 | 0.17.3 | 0.44.2 | 1.95+ |
+| bevy_voice_chat | Bevy | cpal | bevy_replicon (optional) | opus-rs (optional) | Rust |
+|---|---|---|---|---|---|
+| 0.2 | 0.19.0 | 0.17.3 | 0.44.2 | 0.1.34 | 1.95+ |
+| 0.1 | 0.19.0 | 0.17.3 | 0.44.2 | - | 1.95+ |
+
+A default (IMA-ADPCM) 0.2 player and a 0.1 player hear each other: the IMA-ADPCM wire format did
+not change.
 
 cpal 0.17.3 is the version Bevy 0.19's own audio (rodio) uses, so a game has one cpal. Platforms:
 whatever cpal supports (Windows WASAPI, macOS CoreAudio, Linux ALSA; Linux builds need the ALSA
@@ -798,23 +916,53 @@ development package, e.g. `libasound2-dev`). The web is not supported yet.
 | example | what it shows | needs |
 |---|---|---|
 | `cargo run --example quick_start` | open mic + an echo "network": hear yourself through the whole pipeline | mic + headphones |
-| `cargo run --example mic_test` | a settings-style mic test: device lists, live level, loopback, a robot filter; `-- path/to/file.wav` uses a WAV as the mic | mic (or a WAV) + output |
+| `cargo run --example mic_test` | a settings-style mic test: device lists, live level, loopback, a robot filter (`-- --clean` without it); `-- path/to/file.wav` uses a WAV as the mic; with `--features opus`: `-- --opus [--kbps 16\|24\|32]` hears yourself through Opus, `-- --cycle` switches codec at runtime every 5 s | mic (or a WAV) + output |
 | `cargo run --example device_check` | the raw device seam without Bevy: lists devices, records 0.5 s, plays a tone | a sound card |
 
 ## Limitations and FAQ
 
-**Which codec, and why not Opus?** IMA-ADPCM at 16 kHz: 4 bits per sample plus a 4-byte header =
-164 bytes per 20 ms frame, **~66 kbps per talking speaker** (payload; roughly 90 kbps with UDP and
-transport headers, and only while talking). It is pure Rust, costs almost no CPU and every frame
-decodes on its own (a lost packet never corrupts the next). Opus would cut the bandwidth about
-four times, but today it means linking libopus (a C library and toolchain), which breaks the "one
-executable, nothing to bundle" goal. The codec sits behind the `VoiceCodec` trait and every
-packet carries a codec id, so Opus can be added as an optional feature later. The codec is
-currently fixed per build (there is no runtime codec switch yet).
+**Which codec should I use?** Start with the default, **IMA-ADPCM**: 164 bytes per 20 ms frame,
+**~66 kbps per talking player** (roughly 86 kbps with UDP and transport headers, and only while
+talking), no extra dependency, almost no CPU, and every frame decodes on its own (a lost packet
+never corrupts the next). Choose **Opus** (the `opus` feature + `codec: Opus`) when bandwidth
+matters: bigger lobbies, a player hosting on a weak upload, mobile connections. At its default
+24 kbps it needs about 2.5x less bandwidth with similar speech quality; at 32 kbps it scored
+better than IMA-ADPCM on an objective measure and still uses about half the bandwidth (the table
+in [section 13](#13-choosing-a-codec-adpcm-or-opus) has the numbers). Opus hides a lost packet
+with real loss concealment (it continues the voice) instead of repeating the last frame; on the
+same objective measure IMA-ADPCM's simple repeat actually degraded a little less under 5-20 %
+packet loss, so judge that by ear too.
 
-**Bandwidth for a host?** A relaying host uploads each talking voice once per other listener: with
-four players all talking at once, about 3 x 2 x 90 kbps = ~540 kbps. Fine on a LAN or a home
-connection; voice activity keeps it at zero while nobody talks.
+**What does Opus cost?** About 200 us of CPU per 20 ms frame to encode at complexity 5 on a
+desktop CPU (complexity 8-10 roughly doubles it, 0-2 roughly halves it), 7-10 us per frame per
+speaker to decode, and ~173 KB of decoder state per remote speaker. With one encoder and eight
+talking speakers that is about 1.3 % of one core, on the game thread. The Opus library
+(`opus-rs`) is pure Rust but young and uses `unsafe` internally; this crate only hands it packets
+that pass a header check, and every call runs inside `catch_unwind`, so a panic inside it becomes
+an error (and a dropped decoder), not a crash. That cannot help a game built with
+`panic = "abort"`, and it cannot catch undefined behaviour.
+
+**Forward error correction, packet-loss tuning, DTX?** Not offered yet: the Opus library version
+this crate uses cannot decode forward error correction, and its variable-bitrate and FEC modes
+do not behave as documented, so the crate sticks to constant bitrate (or a strict per-frame cap
+with `vbr: true`). DTX (sending nothing in silence) is covered by the voice activity gate and
+push-to-talk already. These settings may come in a later version.
+
+**Bandwidth for a host?** A listen-server host relays every talking voice to every other player
+and sends its own voice to everyone. With everybody talking at once (the worst case) that is
+`(players - 1)^2` streams of upload:
+
+| players | IMA-ADPCM (~86 kbps each) | Opus 24 kbps (~44 kbps each) | Opus 16 kbps (~36 kbps each) |
+|---|---|---|---|
+| 2 | ~86 kbps | ~44 kbps | ~36 kbps |
+| 4 | ~0.8 Mbps | ~0.4 Mbps | ~0.3 Mbps |
+| 6 | ~2.2 Mbps | ~1.1 Mbps | ~0.9 Mbps |
+| 8 | ~4.2 Mbps | ~2.2 Mbps | ~1.8 Mbps |
+
+Usually only one or two players talk at a time: one talker in an 8-player lobby costs the host
+about 7 x 86 = ~600 kbps with IMA-ADPCM, ~300 kbps with Opus 24 kbps. Voice activity and
+push-to-talk keep it at zero while nobody talks. Each player downloads one stream per talking
+player.
 
 **I hear nothing.** Check, in order: `VoiceInput::enabled` is true on both sides;
 `VoiceChatState::output` is `Live`; frames arrive (`VoiceStats::packets_in` grows, `rejected` does
@@ -834,8 +982,10 @@ you need it.
 "who is heard" state is derived locally from the frames played. Captured audio is never written
 anywhere by the crate.
 
-**Other limitations:** mono voices only; linear-interpolation resampling (fine for speech);
-occlusion ("muffled through walls") is up to an incoming filter; the web (wasm) is not supported.
+**Other limitations:** mono voices only; Opus is used in its 16 kHz (wideband) voice mode only
+and accepts only single-frame 20 ms mono packets; linear-interpolation resampling (fine for
+speech); occlusion ("muffled through walls") is up to an incoming filter; the web (wasm) is not
+supported.
 
 ## License
 
@@ -847,6 +997,11 @@ Licensed under either of
 
 at your option.
 
+The optional `opus` feature compiles in [opus-rs](https://crates.io/crates/opus-rs), which is
+licensed under the BSD-3-Clause licence (Copyright Xiph.Org Foundation and contributors, and
+restsend.com), compatible with both licences above. A binary built with the `opus` feature must
+include that notice (its `COPYING` file).
+
 ## Contributing
 
 Issues and pull requests are welcome. Before opening a pull request, please run:
@@ -854,9 +1009,12 @@ Issues and pull requests are welcome. Before opening a pull request, please run:
 ```text
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test --all-features
+cargo test --features opus
+cargo test --no-default-features
 cargo doc --no-deps --all-features
-cargo build --no-default-features
+cargo build --examples --all-features
 ```
 
 Tests must not need audio hardware: go through `AudioIo` with a fake (see `src/app_tests.rs`).

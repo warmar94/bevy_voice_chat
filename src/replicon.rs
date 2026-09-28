@@ -7,7 +7,8 @@
 //!   the host's own voice takes the same path (replicon hands it back locally as
 //!   `FromClient { client_id: ClientId::Server, .. }`).
 //! - The server checks every packet — a known sender ([`VoiceSenderId`] on the client's entity,
-//!   [`HostVoiceSpeaker`] for its own voice), the right codec and exact frame size, the game's own
+//!   [`HostVoiceSpeaker`] for its own voice), a well-formed frame of a known wire codec
+//!   ([`validate_packet`]: IMA-ADPCM or Opus, whatever this build decodes itself), the game's own
 //!   [`VoiceRelayHook`] (mute lists, teams, "spectators can't talk"), then a per-speaker packet
 //!   budget — and relays [`VoiceDown`] to everyone EXCEPT the speaker (itself included).
 //! - Every peer turns [`VoiceDown`] into [`IncomingVoice`] for the pipeline.
@@ -35,8 +36,8 @@
 //! }
 //! ```
 
-use crate::packet::{validate_frame, Reject, TokenBucket};
-use crate::{IncomingVoice, OutgoingVoice, SpeakerId, VoiceChatSystems, VoiceRuntime};
+use crate::packet::{validate_packet, Reject, TokenBucket};
+use crate::{IncomingVoice, OutgoingVoice, SpeakerId, VoiceChatSystems};
 use bevy_app::{App, Plugin, Update};
 use bevy_ecs::prelude::*;
 use bevy_replicon::prelude::*;
@@ -105,7 +106,7 @@ pub struct VoiceRelayStats {
     pub relayed: u64,
     /// Dropped: no speaker id for the sender.
     pub unknown_sender: u64,
-    /// Dropped: wrong codec or size.
+    /// Dropped: unknown codec, wrong size or malformed.
     pub invalid: u64,
     /// Dropped: over the per-speaker packet budget.
     pub rate_limited: u64,
@@ -173,11 +174,12 @@ impl Plugin for VoiceRepliconPlugin {
 struct RelayLimits(VoiceRepliconPlugin);
 
 /// The server's first check of one packet (pure; also usable by a custom relay): a known speaker
-/// and exactly one frame of this build's codec. The relay then asks the [`VoiceRelayHook`] and
-/// spends the speaker's [`TokenBucket`].
-pub fn check_up(speaker: Option<SpeakerId>, up: &VoiceUp, want_codec: u8, want_len: usize) -> Result<SpeakerId, Reject> {
+/// and a well-formed frame of any known wire codec ([`validate_packet`] - the relay needs no
+/// decoder, so a relay built without the `opus` feature still forwards Opus). The relay then asks
+/// the [`VoiceRelayHook`] and spends the speaker's [`TokenBucket`].
+pub fn check_up(speaker: Option<SpeakerId>, up: &VoiceUp) -> Result<SpeakerId, Reject> {
     let speaker = speaker.ok_or(Reject::UnknownSender)?;
-    validate_frame(up.codec, up.frame.len(), want_codec, want_len)?;
+    validate_packet(up.codec, &up.frame)?;
     Ok(speaker)
 }
 
@@ -192,7 +194,6 @@ fn send_voice(mut outgoing: MessageReader<OutgoingVoice>, mut up: MessageWriter<
 fn relay_voice(
     time: Res<Time<Real>>,
     limits: Res<RelayLimits>,
-    rt: Res<VoiceRuntime>,
     host: Res<HostVoiceSpeaker>,
     hook: Res<VoiceRelayHook>,
     senders: Query<&VoiceSenderId>,
@@ -205,15 +206,13 @@ fn relay_voice(
     for b in budgets.buckets.values_mut() {
         b.refill(dt);
     }
-    let codec = rt.codec();
-    let (want_codec, want_len) = (codec.id(), codec.frame_bytes());
     let RelayLimits(VoiceRepliconPlugin { max_packets_per_sec, burst }) = *limits;
     for m in incoming.read() {
         let speaker = match m.client_id {
             ClientId::Server => host.0,
             ClientId::Client(e) => senders.get(e).ok().map(|s| s.0),
         };
-        let speaker = match check_up(speaker, &m.message, want_codec, want_len) {
+        let speaker = match check_up(speaker, &m.message) {
             Ok(s) => s,
             Err(Reject::UnknownSender) => {
                 stats.unknown_sender += 1;

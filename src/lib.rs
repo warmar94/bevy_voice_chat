@@ -16,6 +16,10 @@
 //! [`VoiceStats`]. Hooks: [`VoiceFilters`] (outgoing + incoming processor chains), the
 //! [`io::AudioIo`] device seam ([`VoiceIo`]), the [`codec::VoiceCodec`] trait.
 //!
+//! Codecs: IMA-ADPCM (~66 kbps, the default, always built) or, with the `opus` cargo feature,
+//! Opus (the low-bandwidth option, 24 kbps by default), chosen by [`VoiceChatConfig::codec`].
+//! Receivers play every codec compiled into them, so players on different codecs hear each other.
+//!
 //! With the `replicon` feature, [`replicon::VoiceRepliconPlugin`] is a ready-made transport over
 //! `bevy_replicon` (a client message on an unreliable channel, relayed by the host).
 //!
@@ -69,17 +73,17 @@ pub mod replicon;
 pub mod spatial;
 pub mod wav;
 
-use codec::{MonoFrame, VoiceCodec, FRAME, VOICE_RATE};
+use codec::{CodecError, ImaAdpcm, MonoFrame, OpusSettings, VoiceCodec, VoiceCodecChoice, FRAME, VOICE_RATE};
 use filter::{FilterContext, FilterStage, VoiceFilters};
 use gate::{ms_to_frames, GateInput, TalkGate};
 use io::{AudioIo, MicSession, OutputSession, ScanJob, DEVICE_FAILED, DEVICE_LIVE};
-use jitter::JitterConfig;
+use jitter::{Insert, JitterConfig};
 use mixer::{Mixer, SpeakerKey, StereoFrame};
 use spatial::{Hearing, SpatialParams};
 
 /// Everything a game usually needs: `use bevy_voice_chat::prelude::*;`.
 pub mod prelude {
-    pub use crate::codec::{VoiceCodec, FRAME, FRAME_MS, VOICE_RATE};
+    pub use crate::codec::{OpusSettings, VoiceCodec, VoiceCodecChoice, FRAME, FRAME_MS, VOICE_RATE};
     pub use crate::cpal_io::CpalIo;
     pub use crate::filter::{FilterContext, FilterStage, GainFilter, VoiceFilter, VoiceFilters};
     pub use crate::io::{AudioIo, NullIo};
@@ -194,6 +198,13 @@ pub struct VoiceChatConfig {
     pub speaker_timeout_secs: f32,
     /// [`VoiceActivity`]: a speaker counts as heard this long after its last frame played (ms).
     pub heard_hold_ms: f32,
+    /// The codec this player SENDS with: `ImaAdpcm` (the default) or `Opus` (needs the `opus`
+    /// cargo feature). Receivers decode every codec compiled in. Changing it at runtime applies
+    /// to the next frame sent. There is no automatic fallback: see [`VoiceChatConfig::problems`]
+    /// and [`VoiceChatState::codec_error`].
+    pub codec: VoiceCodecChoice,
+    /// Opus encoder settings (used when `codec` is `Opus`).
+    pub opus: OpusSettings,
 }
 
 impl Default for VoiceChatConfig {
@@ -214,6 +225,8 @@ impl Default for VoiceChatConfig {
             mic_backlog_frames: 5,
             speaker_timeout_secs: 5.0,
             heard_hold_ms: 250.0,
+            codec: VoiceCodecChoice::ImaAdpcm,
+            opus: OpusSettings::default(),
         }
     }
 }
@@ -238,6 +251,13 @@ impl VoiceChatConfig {
         }
         if self.mic_backlog_frames == 0 || !pos(self.speaker_timeout_secs) || !pos(self.heard_hold_ms) {
             out.push("mic_backlog_frames, speaker_timeout_secs, heard_hold_ms must be > 0");
+        }
+        // Checked whatever `codec` is: a config's validity does not depend on the current choice.
+        if !self.opus.problems().is_empty() {
+            out.push("opus.bitrate_bps must be 6000..=64000, opus.complexity 0..=10");
+        }
+        if self.codec == VoiceCodecChoice::Opus && !cfg!(feature = "opus") {
+            out.push("codec: Opus needs the `opus` cargo feature");
         }
         out
     }
@@ -311,6 +331,12 @@ pub struct VoiceChatState {
     pub output_rate: Option<u32>,
     /// What the microphone is ([`io::AudioIo::mic_kind`]).
     pub mic_kind: String,
+    /// The codec this player sends with ([`VoiceChatConfig::codec`]).
+    pub send_codec: VoiceCodecChoice,
+    /// `Some(reason)`: this player's voice CANNOT be sent (the chosen codec is not compiled in,
+    /// its settings are invalid, or its encoder failed). Receiving keeps working. There is no
+    /// automatic fallback: fix the config and sending resumes on the next frame.
+    pub codec_error: Option<String>,
 }
 
 /// **Who is heard right now** (resource; derived from played frames — nothing is networked):
@@ -332,8 +358,13 @@ pub struct VoiceStats {
     pub bytes_out: u64,
     /// [`IncomingVoice`] frames received.
     pub packets_in: u64,
-    /// Incoming frames dropped (wrong codec / size, undecodable).
+    /// Incoming frames dropped (unknown codec, wrong size, malformed, undecodable).
     pub rejected: u64,
+    /// Incoming frames of a codec this build cannot decode (Opus without the `opus` feature):
+    /// dropped.
+    pub unsupported: u64,
+    /// Frames this player's encoder failed on (dropped).
+    pub encode_errors: u64,
     /// Mic-test frames looped back.
     pub loopback: u64,
     /// Mixed stereo frames sent to the output device.
@@ -484,10 +515,22 @@ impl Sessions {
     }
 }
 
+/// Consecutive encode failures (0.5 s of frames) after which sending turns off.
+const ENCODE_FAIL_LIMIT: u32 = 25;
+
 /// The pipeline's working state (resource; written by the crate, read-only outside).
 #[derive(Resource)]
 pub struct VoiceRuntime {
-    codec: Box<dyn VoiceCodec>,
+    /// This player's encoder (`None` = sending is off, see `codec_error`).
+    encoder: Option<Box<dyn VoiceCodec>>,
+    /// The (codec, settings) the encoder was built from.
+    encoder_spec: (VoiceCodecChoice, OpusSettings),
+    codec_error: Option<String>,
+    encode_fail_run: u32,
+    warned_encode: bool,
+    /// The shared stateless decoder for frames decoded on arrival.
+    adpcm: ImaAdpcm,
+    warned_unsupported: bool,
     gate: TalkGate,
     preroll: VecDeque<MonoFrame>,
     seq: u32,
@@ -500,10 +543,17 @@ pub struct VoiceRuntime {
 }
 
 impl VoiceRuntime {
-    /// A fresh runtime with the default codec.
+    /// A fresh runtime; the encoder is built from `cfg.codec` / `cfg.opus` (on failure sending
+    /// is off and [`VoiceRuntime::codec_error`] says why).
     pub fn new(cfg: &VoiceChatConfig) -> Self {
-        Self {
-            codec: codec::default_codec(),
+        let mut rt = Self {
+            encoder: None,
+            encoder_spec: (cfg.codec, cfg.opus),
+            codec_error: None,
+            encode_fail_run: 0,
+            warned_encode: false,
+            adpcm: ImaAdpcm::default(),
+            warned_unsupported: false,
             gate: TalkGate::default(),
             preroll: VecDeque::new(),
             seq: 0,
@@ -513,12 +563,57 @@ impl VoiceRuntime {
             mixer: Mixer::new(cfg.jitter()),
             produced: 0,
             was_playing: false,
+        };
+        rt.build_encoder();
+        rt
+    }
+
+    /// The encoder this player sends with (`None` = sending is off; [`Self::codec_error`] says
+    /// why). A relay should not check packets against it: use [`packet::validate_packet`].
+    pub fn send_codec(&self) -> Option<&dyn VoiceCodec> {
+        self.encoder.as_deref()
+    }
+
+    /// Why sending is off (`None` = it is not).
+    pub fn codec_error(&self) -> Option<&str> {
+        self.codec_error.as_deref()
+    }
+
+    /// Rebuild the encoder when the config asks for another (codec, settings). Never falls back
+    /// to another codec: a failure turns sending off with a reason.
+    fn apply_codec(&mut self, cfg: &VoiceChatConfig) {
+        let spec = (cfg.codec, cfg.opus);
+        if spec == self.encoder_spec && (self.encoder.is_some() || self.codec_error.is_some()) {
+            return;
+        }
+        self.encoder_spec = spec;
+        self.build_encoder();
+    }
+
+    fn build_encoder(&mut self) {
+        let (choice, opus) = self.encoder_spec;
+        self.encode_fail_run = 0;
+        self.warned_encode = false;
+        match codec::new_encoder(choice, &opus) {
+            Ok(e) => {
+                self.encoder = Some(e);
+                self.codec_error = None;
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                tracing::warn!("voice chat: cannot start the {choice:?} encoder: {reason} - voice sending is off");
+                self.encoder = None;
+                self.codec_error = Some(reason);
+            }
         }
     }
 
-    /// The codec in use (a relay checks packets against its id and frame size).
-    pub fn codec(&self) -> &dyn VoiceCodec {
-        self.codec.as_ref()
+    /// Test hook: replace the encoder (keeps the spec, so the config does not rebuild it).
+    #[cfg(test)]
+    pub(crate) fn set_encoder_for_test(&mut self, encoder: Box<dyn VoiceCodec>) {
+        self.encoder = Some(encoder);
+        self.codec_error = None;
+        self.encode_fail_run = 0;
     }
 
     /// Every speaker's jitter buffer, gain and timing (read-only: stats, latency, "who is buffered").
@@ -623,8 +718,18 @@ fn run_devices(
             (o.shared.status(), (r > 0).then_some(r))
         }
     };
-    let want =
-        VoiceChatState { mic, output, mic_level: level, transmitting: state.transmitting, mic_format: format, output_rate: rate, mic_kind: io.0.mic_kind() };
+    // `transmitting`, `send_codec` and `codec_error` belong to `capture_voice`: carried over.
+    let want = VoiceChatState {
+        mic,
+        output,
+        mic_level: level,
+        transmitting: state.transmitting,
+        mic_format: format,
+        output_rate: rate,
+        mic_kind: io.0.mic_kind(),
+        send_codec: state.send_codec,
+        codec_error: state.codec_error.clone(),
+    };
     if *state != want {
         *state = want;
     }
@@ -643,6 +748,11 @@ fn capture_voice(
     mut state: ResMut<VoiceChatState>,
 ) {
     let rt = &mut *rt;
+    // A codec change applies to the next frame sent (before this frame's backlog is encoded).
+    if cfg.is_changed() {
+        rt.apply_codec(&cfg);
+    }
+    publish_codec_state(rt, &mut state);
     rt.gate.hangover = ms_to_frames(cfg.vad_hangover_ms, 0);
     rt.gate.ptt_release = ms_to_frames(cfg.ptt_release_ms, 0);
     let preroll_len = ms_to_frames(cfg.vad_preroll_ms, 0) as usize;
@@ -692,17 +802,33 @@ fn capture_voice(
         let mut batch: Vec<MonoFrame> = rt.preroll.drain(..).collect();
         batch.push(frame);
         for f in &batch {
-            rt.codec.encode(f, &mut rt.encoded);
+            // No encoder = sending is off (`codec_error` says why): the gate and meter still run.
+            let Some(enc) = rt.encoder.as_mut() else { continue };
+            let id = enc.id();
+            if let Err(e) = enc.encode(f, &mut rt.encoded) {
+                stats.encode_errors += 1;
+                rt.encode_fail_run += 1;
+                if !rt.warned_encode {
+                    rt.warned_encode = true;
+                    tracing::warn!("voice chat: the {} encoder failed on a frame: {e} - frame dropped", enc.name());
+                }
+                if rt.encode_fail_run >= ENCODE_FAIL_LIMIT {
+                    tracing::warn!("voice chat: the encoder keeps failing ({e}) - voice sending is off until the codec config changes");
+                    rt.encoder = None;
+                    rt.codec_error = Some(format!("encoder failing: {e}"));
+                }
+                continue;
+            }
+            rt.encode_fail_run = 0;
             if loopback {
-                let mut decoded: MonoFrame = [0.0; FRAME];
-                if rt.codec.decode(&rt.encoded, &mut decoded).is_ok() {
-                    let seq = rt.loop_seq;
-                    rt.loop_seq = rt.loop_seq.wrapping_add(1);
-                    rt.mixer.insert(SpeakerKey::Loopback, seq, &decoded, wall_ms(), now);
+                // The mic test takes the receivers' path: decode on arrival or at playout.
+                let seq = rt.loop_seq;
+                rt.loop_seq = rt.loop_seq.wrapping_add(1);
+                if accept_frame(&mut rt.mixer, &mut rt.adpcm, SpeakerKey::Loopback, seq, id, &rt.encoded, wall_ms(), now).is_ok() {
                     stats.loopback += 1;
                 }
             } else {
-                out.write(OutgoingVoice { seq: rt.seq, ts: wall_ms(), codec: rt.codec.id(), frame: rt.encoded.clone() });
+                out.write(OutgoingVoice { seq: rt.seq, ts: wall_ms(), codec: id, frame: rt.encoded.clone() });
                 rt.seq = rt.seq.wrapping_add(1);
                 stats.packets_out += 1;
                 stats.bytes_out += rt.encoded.len() as u64;
@@ -710,13 +836,37 @@ fn capture_voice(
         }
     }
     rt.captured = frames;
-    let transmitting = rt.gate.is_open() && input.enabled && !loopback;
+    publish_codec_state(rt, &mut state);
+    let transmitting = rt.gate.is_open() && input.enabled && !loopback && rt.encoder.is_some();
     if state.transmitting != transmitting {
         state.transmitting = transmitting;
     }
 }
 
-/// Listener side: decode every [`IncomingVoice`] into its speaker's jitter buffer.
+/// Mirror the runtime's codec choice / error into [`VoiceChatState`] (on change only).
+fn publish_codec_state(rt: &VoiceRuntime, state: &mut ResMut<VoiceChatState>) {
+    let send = rt.encoder_spec.0;
+    if state.send_codec != send || state.codec_error.as_deref() != rt.codec_error.as_deref() {
+        let s = &mut **state;
+        s.send_codec = send;
+        s.codec_error = rt.codec_error.clone();
+    }
+}
+
+/// One validated frame into `key`'s channel: a self-contained frame (IMA-ADPCM) is decoded now;
+/// a frame of a stateful codec (Opus) is stored encoded and decoded in order at playout.
+fn accept_frame(mixer: &mut Mixer, adpcm: &mut ImaAdpcm, key: SpeakerKey, seq: u32, codec: u8, bytes: &[u8], ts: u32, now: f64) -> Result<Insert, CodecError> {
+    if codec == ImaAdpcm::ID {
+        let mut frame: MonoFrame = [0.0; FRAME];
+        adpcm.decode(bytes, &mut frame)?;
+        Ok(mixer.insert(key, seq, &frame, ts, now))
+    } else {
+        Ok(mixer.insert_packet(key, seq, codec, bytes, ts, now))
+    }
+}
+
+/// Listener side: every [`IncomingVoice`] of a codec this build decodes goes into its speaker's
+/// jitter buffer (IMA-ADPCM decoded now, Opus stored for decoding at playout).
 fn receive_voice(
     time: Res<Time<Real>>,
     sessions: Res<Sessions>,
@@ -726,19 +876,27 @@ fn receive_voice(
 ) {
     let rt = &mut *rt;
     let now = time.elapsed_secs_f64();
-    let (want_codec, want_len) = (rt.codec.id(), rt.codec.frame_bytes());
-    let mut frame: MonoFrame = [0.0; FRAME];
     for m in incoming.read() {
         stats.packets_in += 1;
         // Nothing to play to: drop instead of buffering.
         if sessions.output.is_none() {
             continue;
         }
-        if packet::validate_frame(m.codec, m.frame.len(), want_codec, want_len).is_err() || rt.codec.decode(&m.frame, &mut frame).is_err() {
+        if packet::validate_packet(m.codec, &m.frame).is_err() {
             stats.rejected += 1;
             continue;
         }
-        rt.mixer.insert(SpeakerKey::Remote(m.speaker), m.seq, &frame, m.ts, now);
+        if !codec::can_decode(m.codec) {
+            stats.unsupported += 1;
+            if !rt.warned_unsupported {
+                rt.warned_unsupported = true;
+                tracing::warn!("voice chat: received Opus voice but this build has no `opus` feature - enable it to hear these players");
+            }
+            continue;
+        }
+        if accept_frame(&mut rt.mixer, &mut rt.adpcm, SpeakerKey::Remote(m.speaker), m.seq, m.codec, &m.frame, m.ts, now).is_err() {
+            stats.rejected += 1;
+        }
     }
 }
 

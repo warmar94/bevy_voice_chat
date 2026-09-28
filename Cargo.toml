@@ -1,10 +1,10 @@
 [package]
 name = "bevy_voice_chat"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Bevy 0.19's own minimum.
 rust-version = "1.95"
-description = "Game-agnostic, transport-agnostic voice chat for Bevy: capture, voice activity / push-to-talk, filter hooks, a pure-Rust codec, jitter buffers and proximity mixing."
+description = "Game-agnostic, transport-agnostic voice chat for Bevy: capture, voice activity / push-to-talk, filter hooks, pure-Rust codecs (IMA-ADPCM, optional Opus), jitter buffers and proximity mixing."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/warmar94/bevy_voice_chat"
 readme = "README.md"
@@ -15,6 +15,9 @@ exclude = ["NOTES.md", "docs/", "/target"]
 
 [features]
 default = []
+# Opus (pure Rust, opus-rs) as a second codec: 24 kbps instead of 65.6 (the low-bandwidth option).
+# Receivers decode every codec compiled in; without it Opus packets are dropped and counted.
+opus = ["dep:opus-rs"]
 # A ready-made transport over bevy_replicon: a client message on an unreliable channel, a host
 # relay with packet checks + a rate limit + a pluggable validation hook.
 replicon = ["dep:bevy_replicon", "dep:bevy_state"]
@@ -33,6 +36,10 @@ serde = { version = "1.0.228", features = ["derive"] }
 # The version Bevy 0.19's audio stack (rodio 0.22) uses -> one cpal in a game's tree.
 cpal = { version = "=0.17.3" }
 bevy_replicon = { version = "=0.44.2", default-features = false, features = ["client", "server"], optional = true }
+# Pure Rust, zero dependencies, BSD-3-Clause. Pinned EXACTLY: its VBR / FEC behaviour is worked
+# around in `codec::Opus`, so a bump is a deliberate change (re-run the Opus tests). `heap` MUST stay
+# on: without it the codec state (~250 KB / ~175 KB) is stored inline and overflows small stacks.
+opus-rs = { version = "=0.1.34", default-features = false, features = ["std", "heap"], optional = true }
 # `in_state` run conditions for the replicon transport (replicon itself already needs bevy_state).
 bevy_state = { version = "=0.19.0", default-features = false, features = ["std"], optional = true }
 
