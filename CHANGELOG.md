@@ -6,6 +6,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (before 1.0, a breaking
 change or a Bevy / key dependency bump raises the minor version).
 
+## [0.2.1] - 2026-09-29
+
+Device labels, for Bevy 0.19.0, cpal 0.17.3 and opus-rs 0.1.34. The public API is unchanged.
+
+### Changed
+
+- **Device labels** (`CpalIo`): `VoiceDevices` lists, and `VoiceInput::{input_device,
+  output_device}` take, one label per device. On Windows that is the Sound settings' friendly
+  name ("Microphone (USB PnP Audio Device)", or "name (interface)" when Windows reports no
+  friendly name) instead of the short "Microphone", so two devices with the same short name are
+  now two choices (0.2.0 listed only the first and could only open the first). A label still
+  shared by several devices gets " #2", " #3" (never a label another device really has). On
+  other platforms labels are the reported name (numbered the same way), and on Linux / BSD a
+  sound card that ALSA lists once per mode stays ONE choice, as in 0.2.0. `VoiceChatState`
+  reports the opened device's label.
+- A plain device name saved by 0.1 / 0.2.0 ("Microphone") keeps opening the first device with
+  that name, before and after the device scan lands (no switch to the system default, no
+  reopen). A blank setting means the system default.
+
+### Fixed
+
+- Listing devices can no longer take the microphone / output thread down: a device whose driver
+  panics while being described (WASAPI can, on a broken endpoint) is left out of the list and
+  the others are listed; a panic while enumerating falls back to the system default.
+
+### Internal
+
+- Stereo / sample-pair loops use `as_chunks::<2>()` / `as_chunks_mut::<2>()` (arrays) instead of
+  `chunks_exact(2)` (slices), the style newer clippy asks for (`chunks_exact_to_as_chunks`,
+  Rust 1.98). Both APIs exist since Rust 1.88, below this crate's `rust-version` 1.95. No
+  behaviour change (PCM16 decode and the stereo mix output are unchanged).
+- CI pins the Rust toolchain to 1.96.0 instead of `stable`.
+- Tests: device labels (Windows friendly names, "name (interface)", Linux merging, numbering,
+  a real "#2" name), matching old plain names, an app test that an old plain name survives the
+  scan without a reopen, and a blank setting = the system default.
+
 ## [0.2.0] - 2026-09-28
 
 Opus as an optional second codec, for Bevy 0.19.0, cpal 0.17.3 and opus-rs 0.1.34.

@@ -15,13 +15,22 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 
-/// The input + output device names of one scan.
+/// The input + output device labels of one scan (each label names exactly one device; see
+/// `CpalIo` in the README for how labels are built).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeviceLists {
-    /// Input device names.
+    /// Input device labels.
     pub inputs: Vec<String>,
-    /// Output device names.
+    /// Output device labels.
     pub outputs: Vec<String>,
+}
+
+/// Whether a device setting names this listed label: the label itself, or the plain name it was
+/// built from (a setting saved before 0.2.1 stored "Microphone"; the list now says
+/// "Microphone (USB PnP Audio Device)" or "Microphone #2"). Pure (tested).
+pub(crate) fn setting_names_label(setting: &str, label: &str) -> bool {
+    let setting = setting.trim();
+    !setting.is_empty() && (label == setting || label.strip_prefix(setting).is_some_and(|rest| rest.starts_with(" (") || rest.starts_with(" #")))
 }
 
 /// A scan in flight: the worker fills it once.
@@ -102,7 +111,7 @@ impl MicShared {
         self.state.load(Ordering::Relaxed)
     }
 
-    /// The device name (empty until opened).
+    /// The device label (empty until opened; what the device lists show).
     pub fn device_name(&self) -> String {
         self.device.lock().map(|d| d.clone()).unwrap_or_default()
     }
@@ -173,7 +182,7 @@ impl OutputShared {
         self.state.store(s, Ordering::Relaxed);
     }
 
-    /// The device name (empty until opened).
+    /// The device label (empty until opened; what the device lists show).
     pub fn device_name(&self) -> String {
         self.device.lock().map(|d| d.clone()).unwrap_or_default()
     }

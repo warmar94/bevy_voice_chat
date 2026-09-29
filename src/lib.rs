@@ -137,9 +137,11 @@ pub struct VoiceInput {
     pub mic_gain: f32,
     /// Voice output volume `0..=1` (the game applies its master volume into it).
     pub volume: f32,
-    /// Input device by name (`None` / unknown = the system default).
+    /// Input device: a label from [`VoiceDevices::inputs`] (a plain name saved before 0.2.1 still
+    /// works); `None` / unknown = the system default.
     pub input_device: Option<String>,
-    /// Output device by name (`None` / unknown = the system default).
+    /// Output device: a label from [`VoiceDevices::outputs`] (a plain name saved before 0.2.1
+    /// still works); `None` / unknown = the system default.
     pub output_device: Option<String>,
     /// Distance applies right now (e.g. in a level; off in menus = everyone at full volume).
     pub positional: bool,
@@ -292,9 +294,9 @@ pub struct RescanDevices;
 pub struct VoiceDevices {
     /// A scan has landed.
     pub scanned: bool,
-    /// Input device names (what [`VoiceInput::input_device`] takes).
+    /// Input device labels (what [`VoiceInput::input_device`] takes; one per device).
     pub inputs: Vec<String>,
-    /// Output device names (what [`VoiceInput::output_device`] takes).
+    /// Output device labels (what [`VoiceInput::output_device`] takes; one per device).
     pub outputs: Vec<String>,
 }
 
@@ -655,13 +657,15 @@ fn scan_devices(io: Res<VoiceIo>, mut rescan: MessageReader<RescanDevices>, mut 
     }
 }
 
-/// The device to open for a wanted name: known name -> it; unknown / unscanned -> as asked (the
-/// seam falls back to the default for an unknown name); `None` = the system default.
+/// The device to open for a setting: `None` = the system default. Before the first scan the
+/// setting goes to the seam as asked (it falls back to the default itself); after it, a setting
+/// that names a listed device (its label, or the plain name a pre-0.2.1 setting stored, see
+/// [`io::setting_names_label`]) goes as asked, anything else = the system default. The setting is
+/// passed on trimmed, the same before and after the scan, so the open session never flips when
+/// the scan lands. An empty / blank setting = the system default.
 fn device_to_open(wanted: Option<&str>, list: &[String], scanned: bool) -> Option<String> {
-    match wanted {
-        Some(n) if !scanned || list.iter().any(|d| d == n) => Some(n.to_string()),
-        _ => None,
-    }
+    let n = wanted.map(str::trim).filter(|n| !n.is_empty())?;
+    (!scanned || list.iter().any(|label| io::setting_names_label(n, label))).then(|| n.to_string())
 }
 
 /// Open / close / reopen the microphone and the output as [`VoiceInput`] asks; write the device

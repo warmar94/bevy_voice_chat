@@ -24,50 +24,162 @@ use tracing::warn;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CpalIo;
 
-/// A device's human-readable name (what a game stores in its settings).
-fn device_name(d: &cpal::Device) -> Option<String> {
-    d.description().ok().map(|desc| desc.name().trim().to_string()).filter(|n| !n.is_empty())
+/// One enumerated device: the cpal handle, the LABEL a player sees and a game stores
+/// ([`device_labels`]), and the plain name 0.1 / 0.2.0 stored (still accepted by [`pick`]).
+struct Entry {
+    device: cpal::Device,
+    label: String,
+    name: String,
 }
 
-/// Every input and output device name, deduplicated in order. Errors = empty lists.
+/// Whether cpal's default host here lists each device once (Windows / WASAPI, macOS /
+/// CoreAudio, ...): then two entries with one label are two real devices and get numbered, and
+/// Windows' friendly "Name (Interface)" is used. On Linux / BSD (ALSA) cpal lists ONE card
+/// several times, once per PCM mode (`sysdefault:`, `front:`, `hw:`, `plughw:`, ...), all under
+/// the same name; there identical labels are merged into one entry, as 0.2.0 did, instead of
+/// becoming meaningless "#2".."#8" choices.
+const DISTINCT_ENDPOINTS: bool = !cfg!(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"));
+
+/// The label of one device before duplicates are handled.
+///
+/// On a host with distinct endpoints (`distinct`, Windows): the full friendly name
+/// ("Microphone (USB PnP Audio Device)"), which WASAPI puts in `extended` when it differs from
+/// the short name; failing that, "name (driver)" from the interface name WASAPI reports as the
+/// driver; failing that, the name. Elsewhere: the plain name (ALSA's `extended` holds the card's
+/// description lines, not a friendly name). Pure (tested).
+pub(crate) fn raw_label(name: &str, extended: &[String], driver: Option<&str>, distinct: bool) -> String {
+    let name = name.trim();
+    if !distinct {
+        return name.to_string();
+    }
+    let prefix = format!("{name} (");
+    if let Some(friendly) = extended.iter().map(|l| l.trim()).find(|l| l.starts_with(&prefix) && l.ends_with(')')) {
+        return friendly.to_string();
+    }
+    match driver.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) if !name.ends_with(&format!("({d})")) => format!("{name} ({d})"),
+        _ => name.to_string(),
+    }
+}
+
+/// Final labels in enumeration order; `None` = merged into an earlier entry (not listed).
+///
+/// `number` (hosts with distinct endpoints): every device is listed, and the 2nd, 3rd... device
+/// whose label is taken gets " #2", " #3"..., never a label another device really has, so each
+/// label picks exactly one device. Otherwise identical labels are merged (the first one
+/// stays). Pure (tested).
+pub(crate) fn device_labels(raw: &[String], number: bool) -> Vec<Option<String>> {
+    let mut used: Vec<String> = Vec::with_capacity(raw.len());
+    let mut out = Vec::with_capacity(raw.len());
+    for label in raw {
+        if !used.contains(label) {
+            used.push(label.clone());
+            out.push(Some(label.clone()));
+            continue;
+        }
+        if !number {
+            out.push(None);
+            continue;
+        }
+        let mut n = 2;
+        let mut candidate = format!("{label} #{n}");
+        while used.contains(&candidate) || raw.contains(&candidate) {
+            n += 1;
+            candidate = format!("{label} #{n}");
+        }
+        used.push(candidate.clone());
+        out.push(Some(candidate));
+    }
+    out
+}
+
+/// Which entry a stored setting means: its exact label, else (a setting saved by 0.1 / 0.2.0,
+/// which stored the plain name) the first device with that plain name; `None` = not present.
+/// Pure (tested).
+pub(crate) fn match_setting(labels: &[String], names: &[String], wanted: &str) -> Option<usize> {
+    let wanted = wanted.trim();
+    labels.iter().position(|l| l == wanted).or_else(|| names.iter().position(|n| n == wanted))
+}
+
+/// Every device of one direction with its label. Devices without a name are skipped, and so is
+/// a device whose driver panics while being described (WASAPI `description()` can `expect` on a
+/// broken endpoint): it is left out, the others are listed.
+fn entries(devs: Vec<cpal::Device>) -> Vec<Entry> {
+    let named: Vec<(cpal::Device, String, String)> = devs
+        .into_iter()
+        .filter_map(|d| {
+            let desc = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.description().ok())).ok().flatten()?;
+            let name = desc.name().trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let raw = raw_label(&name, desc.extended(), desc.driver(), DISTINCT_ENDPOINTS);
+            Some((d, name, raw))
+        })
+        .collect();
+    let raws: Vec<String> = named.iter().map(|(_, _, r)| r.clone()).collect();
+    named
+        .into_iter()
+        .zip(device_labels(&raws, DISTINCT_ENDPOINTS))
+        .filter_map(|((device, name, _), label)| label.map(|label| Entry { device, label, name }))
+        .collect()
+}
+
+/// Every device of one direction, labelled. A panic while enumerating (a driver) is an error
+/// here, never a dead thread; one device failing to describe itself is skipped in [`entries`].
+fn list(host: &cpal::Host, input: bool) -> Result<Vec<Entry>, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let devs: Result<Vec<cpal::Device>, _> = if input { host.input_devices().map(|d| d.collect()) } else { host.output_devices().map(|d| d.collect()) };
+        devs.map(entries).map_err(|e| e.to_string())
+    }))
+    .unwrap_or_else(|_| Err("a device driver failed while listing".into()))
+}
+
+/// Every input and output device label, in order. Errors = empty lists.
 fn scan() -> DeviceLists {
     let host = cpal::default_host();
-    let names = |devs: Option<Vec<cpal::Device>>| {
-        let mut out: Vec<String> = Vec::new();
-        for n in devs.unwrap_or_default().iter().filter_map(device_name) {
-            if !out.contains(&n) {
-                out.push(n);
-            }
-        }
-        out
+    let labels = |input: bool| -> Vec<String> {
+        let what = if input { "microphones" } else { "output devices" };
+        list(&host, input).inspect_err(|e| warn!("voice chat: cannot list {what} ({e})")).unwrap_or_default().into_iter().map(|e| e.label).collect()
     };
-    let inputs = host.input_devices().map(|d| d.collect()).inspect_err(|e| warn!("voice chat: cannot list microphones ({e})")).ok();
-    let outputs = host.output_devices().map(|d| d.collect()).inspect_err(|e| warn!("voice chat: cannot list output devices ({e})")).ok();
-    DeviceLists { inputs: names(inputs), outputs: names(outputs) }
+    DeviceLists { inputs: labels(true), outputs: labels(false) }
 }
 
-/// `wanted` by name (else the system default; `None` + a warning when there is none).
-fn pick(host: &cpal::Host, wanted: Option<&str>, input: bool) -> Option<cpal::Device> {
+/// `wanted` by label (or a 0.1 / 0.2.0 plain name), else the system default; `None` + a warning
+/// when there is none. Returns the device and the label to report.
+fn pick(host: &cpal::Host, wanted: Option<&str>, input: bool) -> Option<(cpal::Device, String)> {
     let what = if input { "microphone" } else { "output device" };
-    let named = wanted.and_then(|w| {
-        let list = if input { host.input_devices().ok().map(|d| d.collect::<Vec<_>>()) } else { host.output_devices().ok().map(|d| d.collect::<Vec<_>>()) };
-        let found = list.unwrap_or_default().into_iter().find(|d| device_name(d).as_deref() == Some(w));
-        if found.is_none() {
-            warn!("voice chat: {what} {w:?} not found - using the system default");
+    let all = list(host, input).inspect_err(|e| warn!("voice chat: cannot list {what}s ({e})")).unwrap_or_default();
+    let labels: Vec<String> = all.iter().map(|e| e.label.clone()).collect();
+    let names: Vec<String> = all.iter().map(|e| e.name.clone()).collect();
+    if let Some(w) = wanted {
+        match match_setting(&labels, &names, w) {
+            Some(i) => return all.into_iter().nth(i).map(|e| (e.device, e.label)),
+            None => warn!("voice chat: {what} {w:?} not found - using the system default"),
         }
-        found
-    });
-    let d = named.or_else(|| if input { host.default_input_device() } else { host.default_output_device() });
-    if d.is_none() {
-        warn!("voice chat: no {what} found");
     }
-    d
+    let Some(d) = (if input { host.default_input_device() } else { host.default_output_device() }) else {
+        warn!("voice chat: no {what} found");
+        return None;
+    };
+    // The default's label, found by id in the same list, so the state shows what the menu shows.
+    let label = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let id = d.id().ok();
+        all.iter()
+            .find(|e| id.is_some() && e.device.id().ok() == id)
+            .map(|e| e.label.clone())
+            .or_else(|| d.description().ok().map(|desc| raw_label(desc.name(), desc.extended(), desc.driver(), DISTINCT_ENDPOINTS)))
+    }))
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    Some((d, label))
 }
 
 /// The capture thread: open the mic, publish peaks + frames until `stop` is dropped.
 fn capture(wanted: Option<String>, shared: Arc<MicShared>, frames: SyncSender<MonoFrame>, stop: mpsc::Receiver<()>) {
     let host = cpal::default_host();
-    let Some(device) = pick(&host, wanted.as_deref(), true) else {
+    let Some((device, label)) = pick(&host, wanted.as_deref(), true) else {
         shared.set_state(DEVICE_FAILED);
         return;
     };
@@ -85,7 +197,7 @@ fn capture(wanted: Option<String>, shared: Arc<MicShared>, frames: SyncSender<Mo
         return;
     }
     if let Ok(mut d) = shared.device.lock() {
-        *d = device_name(&device).unwrap_or_default();
+        *d = label;
     }
     shared.set_state(DEVICE_LIVE);
     // Blocks until the session (holding the sender) is dropped.
@@ -157,7 +269,7 @@ where
 /// The output thread: open the device, play queued frames until `stop` is dropped.
 fn playback(wanted: Option<String>, shared: Arc<OutputShared>, frames: Receiver<StereoFrame>, stop: mpsc::Receiver<()>) {
     let host = cpal::default_host();
-    let Some(device) = pick(&host, wanted.as_deref(), false) else {
+    let Some((device, label)) = pick(&host, wanted.as_deref(), false) else {
         shared.set_state(DEVICE_FAILED);
         return;
     };
@@ -175,7 +287,7 @@ fn playback(wanted: Option<String>, shared: Arc<OutputShared>, frames: Receiver<
         return;
     }
     if let Ok(mut d) = shared.device.lock() {
-        *d = device_name(&device).unwrap_or_default();
+        *d = label;
     }
     shared.set_state(DEVICE_LIVE);
     let _ = stop.recv();

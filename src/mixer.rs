@@ -292,14 +292,13 @@ impl Mixer {
             }
             filter(*key, &mut frame);
             any = true;
-            for (i, (s, pair)) in frame.iter().zip(out.chunks_exact_mut(2)).enumerate() {
+            for (i, (s, pair)) in frame.iter().zip(out.as_chunks_mut::<2>().0).enumerate() {
                 let t = (i + 1) as f32 / FRAME as f32;
                 let l = g0.0 + (g1.0 - g0.0) * t;
                 let r = g0.1 + (g1.1 - g0.1) * t;
-                if let [a, b] = pair {
-                    *a += s * l;
-                    *b += s * r;
-                }
+                let [a, b] = pair;
+                *a += s * l;
+                *b += s * r;
             }
         }
         for s in out.iter_mut() {

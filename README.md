@@ -207,8 +207,8 @@ fn drive_voice(lobby: Res<Lobby>, mut input: ResMut<VoiceInput>) {
 | `talk_held` | `false` | push-to-talk: your talk input is held |
 | `mic_gain` | `1.0` | microphone gain (clamped to `0..=4`) |
 | `volume` | `1.0` | voice output volume `0..=1` |
-| `input_device` | `None` | microphone by name (`None` or a missing name = system default) |
-| `output_device` | `None` | output device by name (`None` or a missing name = system default) |
+| `input_device` | `None` | microphone by label, one of `VoiceDevices::inputs` (`None` or a missing label = system default) |
+| `output_device` | `None` | output device by label, one of `VoiceDevices::outputs` (`None` or a missing label = system default) |
 | `positional` | `true` | distance applies right now (see [section 5](#5-positional-voice-speakers-and-the-listener)) |
 
 > With the default `Hearing::Proximity` and `positional: true`, a remote voice is only heard when
@@ -384,7 +384,7 @@ fn audio_settings(devices: Res<VoiceDevices>, state: Res<VoiceChatState>, mut in
     if devices.scanned {
         let _mics: &[String] = &devices.inputs; // choices for a dropdown (+ devices.outputs)
     }
-    input.input_device = None; // or Some(name): a name that disappeared falls back to the default
+    input.input_device = None; // or Some(label): a label that disappeared falls back to the default
     input.mic_gain = 1.5;
     input.threshold = 0.1;
     // The meter: `mic_level` is on the same 0..=1 scale as `threshold` (after `mic_gain`).
@@ -472,6 +472,20 @@ so a misbehaving filter cannot break the encoder or anyone's ears. `FilterContex
 All hardware goes through the `AudioIo` trait inside the `VoiceIo` resource:
 
 - `CpalIo` (default): real devices through cpal, each on its own thread.
+  **Device labels:** `VoiceDevices` lists one label per device, and `VoiceInput::input_device` /
+  `output_device` take one of them (store the label the player picked).
+  - **Windows:** the full friendly name from the Sound settings ("Microphone (USB PnP Audio
+    Device)"), so two devices Windows both calls "Microphone" are two choices. Every device is
+    listed; if two still share a label, the later ones get " #2", " #3" (never a label another
+    device really has). "#N" follows the order Windows lists devices in, which can change after a
+    replug or a reboot, so with two identical devices "X #2" may later open the other one.
+  - **macOS and other platforms:** the name the OS reports; two devices with the same name are
+    numbered the same way.
+  - **Linux / BSD:** the name ALSA reports. ALSA lists one sound card once per mode under the same
+    name, so identical names are merged into one choice (as in 0.2.0).
+  - **Settings saved by 0.1 / 0.2.0** stored the plain name ("Microphone"); it still opens the first
+    device with that name. A label that is no longer present (unplugged, renamed) falls back to the
+    system default with a warning.
 - `WavFileIo`: a WAV file (PCM 8/16/24/32-bit or float, any rate / channels) played in a loop as
   the microphone; output and device lists still go to the inner seam. Handy for testing two game
   instances on one machine.
@@ -754,7 +768,7 @@ The full documentation is generated with `cargo doc --open --all-features`. Ever
 | `VoiceChatConfig::problems()` | fn | `assert!(cfg.problems().is_empty())` |
 | `VoiceChatConfig::jitter()` / `spatial()` / `output_queue_frames()` | fn | the derived `JitterConfig`, `SpatialParams`, queue depth in frames |
 | `RescanDevices` | message (you write) | `rescan.write(RescanDevices);` |
-| `VoiceDevices { scanned, inputs, outputs }` | resource (read) | `for name in &devices.inputs { .. }` |
+| `VoiceDevices { scanned, inputs, outputs }` | resource (read) | device labels: `for label in &devices.inputs { .. }` |
 | `DeviceState::{Closed, Opening, Live(name), Failed}` | enum | `state.mic == DeviceState::Failed` |
 | `VoiceChatState { mic, output, mic_level, transmitting, mic_format, output_rate, mic_kind, send_codec, codec_error }` | resource (read) | `meter.set(state.mic_level)`; `if let Some(why) = &state.codec_error { .. }` |
 | `VoiceActivity { heard, transmitting }` | resource (read) | `activity.heard.contains(&SpeakerId(2))` |

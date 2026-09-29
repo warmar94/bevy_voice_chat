@@ -256,6 +256,48 @@ fn device_choices_reopen_and_an_unknown_device_uses_the_default() {
 }
 
 #[test]
+fn a_plain_device_name_saved_before_labels_keeps_its_device_after_the_scan() {
+    // A pre-0.2.1 settings file says "Microphone"; the list now holds labels.
+    let lists = DeviceLists {
+        inputs: vec!["Microphone (USB PnP Audio Device)".into(), "Microphone (Steam Streaming Microphone)".into()],
+        outputs: vec!["Speakers (Realtek USB2.0 Audio)".into()],
+    };
+    let fake = Arc::new(FakeIo { lists, ..default() });
+    let mut app = app_with(fake.clone());
+    {
+        let mut i = input(&mut app);
+        i.enabled = true;
+        i.input_device = Some("Microphone".into());
+        i.output_device = Some("Speakers".into());
+    }
+    for _ in 0..4 {
+        app.update();
+    }
+    assert!(app.world().resource::<VoiceDevices>().scanned, "the scan landed");
+    assert_eq!(fake.last_mic().0.as_deref(), Some("Microphone"), "still asked for by its old name (the seam matches it)");
+    assert_eq!(fake.last_out_device().as_deref(), Some("Speakers"));
+    let opened = (fake.mics.lock().expect("lock").len(), fake.outs.lock().expect("lock").len());
+    assert_eq!(opened, (1, 1), "opened once: no silent switch to the default when the scan lands");
+}
+
+#[test]
+fn a_blank_device_setting_is_the_system_default() {
+    let fake = Arc::new(FakeIo { lists: lists(), ..default() });
+    let mut app = app_with(fake.clone());
+    {
+        let mut i = input(&mut app);
+        i.enabled = true;
+        i.input_device = Some("   ".into());
+        i.output_device = Some(String::new());
+    }
+    app.update();
+    app.update();
+    assert_eq!(fake.last_mic().0, None, "a blank setting opens the system default");
+    assert_eq!(fake.last_out_device(), None);
+    assert_eq!((fake.mics.lock().expect("lock").len(), fake.outs.lock().expect("lock").len()), (1, 1), "and never reopens");
+}
+
+#[test]
 fn no_microphone_is_a_state_never_a_panic() {
     let fake = Arc::new(FakeIo { fail: true, ..default() });
     let mut app = app_with(fake.clone());

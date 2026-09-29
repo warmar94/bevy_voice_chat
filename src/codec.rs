@@ -395,10 +395,8 @@ impl VoiceCodec for Pcm16 {
         if bytes.len() != want {
             return Err(CodecError::WrongLength { got: bytes.len(), want });
         }
-        for (slot, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
-            if let [a, b] = pair {
-                *slot = from_i16(i16::from_le_bytes([*a, *b]));
-            }
+        for (slot, pair) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
+            *slot = from_i16(i16::from_le_bytes(*pair));
         }
         Ok(())
     }

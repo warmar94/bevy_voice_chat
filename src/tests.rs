@@ -155,8 +155,8 @@ fn the_output_pump_resamples_to_the_device_and_counts_consumed_frames() {
     let shared = Arc::new(OutputShared::default());
     let mut pump = OutputPump::new(rx, VOICE_RATE, 48_000, shared.clone());
     let mut f = [0.0; FRAME * 2];
-    for pair in f.chunks_exact_mut(2) {
-        pair.copy_from_slice(&[0.5, -0.25]);
+    for pair in f.as_chunks_mut::<2>().0 {
+        *pair = [0.5, -0.25];
     }
     tx.send(f).expect("queued");
     let mut out = vec![0.0; 960 * 2];
@@ -1385,4 +1385,114 @@ fn problems_lists_bad_opus_settings_and_a_missing_feature() {
     assert!(!missing && opus.problems().is_empty());
     #[cfg(not(feature = "opus"))]
     assert!(missing);
+}
+
+// ---- device labels (cpal_io: what the settings list shows and a game stores) ----
+
+fn strings(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+fn listed(raw: &[&str], number: bool) -> Vec<Option<String>> {
+    crate::cpal_io::device_labels(&strings(raw), number)
+}
+
+#[test]
+fn a_windows_device_is_labelled_with_its_friendly_name() {
+    use crate::cpal_io::raw_label;
+    // WASAPI: short name + the full friendly name as an extended line.
+    assert_eq!(
+        raw_label("Microphone", &strings(&["Microphone (USB PnP Audio Device)"]), Some("USB PnP Audio Device"), true),
+        "Microphone (USB PnP Audio Device)"
+    );
+    // No friendly line: "name (interface)" from the driver field.
+    assert_eq!(raw_label("Speakers", &[], Some("Realtek USB2.0 Audio"), true), "Speakers (Realtek USB2.0 Audio)");
+    // The name already IS the friendly name (DeviceDesc missing): not doubled.
+    assert_eq!(raw_label("Speakers (Realtek USB2.0 Audio)", &[], Some("Realtek USB2.0 Audio"), true), "Speakers (Realtek USB2.0 Audio)");
+    // Nothing more to go on: the name, trimmed.
+    assert_eq!(raw_label("  Headphones ", &strings(&["Headphones"]), None, true), "Headphones");
+    // Only "<name> (...)" counts as a friendly name: a longer name sharing the prefix does not.
+    assert_eq!(raw_label("Mic", &strings(&["Microphone (X)"]), None, true), "Mic");
+}
+
+#[test]
+fn a_linux_card_keeps_its_plain_name() {
+    use crate::cpal_io::raw_label;
+    // ALSA: extended = every DESC line (the first repeats the name), driver = the PCM id.
+    let ext = strings(&["HDA Intel PCH, ALC892 Analog", "Front output / input"]);
+    assert_eq!(raw_label("HDA Intel PCH, ALC892 Analog", &ext, Some("front:CARD=PCH,DEV=0"), false), "HDA Intel PCH, ALC892 Analog");
+}
+
+#[test]
+fn every_windows_device_is_listed_and_a_repeated_label_is_numbered() {
+    let raw = ["Microphone (USB PnP Audio Device)", "Headset Microphone (Oculus)", "Microphone (USB PnP Audio Device)", "Microphone (USB PnP Audio Device)"];
+    let got: Vec<String> = listed(&raw, true).into_iter().flatten().collect();
+    assert_eq!(
+        got,
+        strings(&[
+            "Microphone (USB PnP Audio Device)",
+            "Headset Microphone (Oculus)",
+            "Microphone (USB PnP Audio Device) #2",
+            "Microphone (USB PnP Audio Device) #3"
+        ]),
+        "no device is dropped, each label is unique"
+    );
+    assert!(listed(&[], true).is_empty());
+}
+
+#[test]
+fn numbering_never_takes_a_label_a_real_device_has() {
+    // A real device called "Mic #2" keeps its label, wherever it is in the list.
+    let got: Vec<String> = listed(&["Mic", "Mic", "Mic #2"], true).into_iter().flatten().collect();
+    assert_eq!(got, strings(&["Mic", "Mic #3", "Mic #2"]));
+    let got: Vec<String> = listed(&["Mic #2", "Mic", "Mic"], true).into_iter().flatten().collect();
+    assert_eq!(got, strings(&["Mic #2", "Mic", "Mic #3"]));
+}
+
+#[test]
+fn a_linux_card_listed_once_per_pcm_mode_is_one_choice() {
+    // ALSA lists one card as sysdefault / front / hw / plughw / dsnoop ... all with one name.
+    let card = "HDA Intel PCH, ALC892 Analog";
+    let got = listed(&[card, card, card, "USB Audio Device", card], false);
+    assert_eq!(got, vec![Some(card.to_string()), None, None, Some("USB Audio Device".to_string()), None], "merged like 0.2.0, never \"#2\"..\"#8\"");
+}
+
+#[test]
+fn two_microphones_with_the_same_short_name_become_two_choices() {
+    use crate::cpal_io::raw_label;
+    // The owner's PC: a USB mic and Steam's streaming mic, both called "Microphone" by Windows.
+    let raw = vec![
+        raw_label("Microphone", &strings(&["Microphone (USB PnP Audio Device)"]), None, true),
+        raw_label("Headset Microphone", &strings(&["Headset Microphone (Oculus Virtual Audio Device)"]), None, true),
+        raw_label("Microphone", &strings(&["Microphone (Steam Streaming Microphone)"]), None, true),
+    ];
+    let labels: Vec<String> = crate::cpal_io::device_labels(&raw, true).into_iter().flatten().collect();
+    assert_eq!(labels.len(), 3, "0.2.0 listed only 2 of these (the second \"Microphone\" was dropped)");
+    assert_ne!(labels[0], labels[2]);
+}
+
+#[test]
+fn a_setting_picks_its_label_and_a_plain_name_from_0_2_0_still_works() {
+    use crate::cpal_io::match_setting;
+    let labels = strings(&["Microphone (USB PnP Audio Device)", "Headset Microphone (Oculus)", "Microphone (Steam Streaming Microphone)"]);
+    let names = strings(&["Microphone", "Headset Microphone", "Microphone"]);
+    assert_eq!(match_setting(&labels, &names, "Microphone (Steam Streaming Microphone)"), Some(2), "the exact label");
+    assert_eq!(match_setting(&labels, &names, "Microphone"), Some(0), "an old setting (plain name) = the first such device, as in 0.2.0");
+    assert_eq!(match_setting(&labels, &names, " Headset Microphone (Oculus) "), Some(1), "trimmed");
+    assert_eq!(match_setting(&labels, &names, "Unplugged Mic"), None, "missing = the caller falls back to the system default");
+    let labels = strings(&["Mic (X)", "Mic (X) #2"]);
+    let names = strings(&["Mic", "Mic"]);
+    assert_eq!(match_setting(&labels, &names, "Mic (X) #2"), Some(1), "a numbered duplicate is its own choice");
+}
+
+#[test]
+fn a_setting_names_its_label_or_the_plain_name_it_came_from() {
+    use crate::io::setting_names_label;
+    assert!(setting_names_label("Microphone (USB PnP Audio Device)", "Microphone (USB PnP Audio Device)"));
+    assert!(setting_names_label("Microphone", "Microphone (USB PnP Audio Device)"), "a pre-0.2.1 plain name");
+    assert!(setting_names_label("Microphone", "Microphone #2"));
+    assert!(setting_names_label(" Microphone ", "Microphone (X)"), "trimmed");
+    assert!(!setting_names_label("Mic", "Microphone (X)"), "a prefix of the WORD is not the name");
+    assert!(!setting_names_label("", "Microphone"), "an empty setting names nothing");
+    assert!(!setting_names_label("Speakers", "Microphone (X)"));
 }
