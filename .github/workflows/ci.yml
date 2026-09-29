@@ -10,13 +10,16 @@ env:
   RUSTFLAGS: -D warnings
   RUSTDOCFLAGS: -D warnings
 
+# Rust is pinned to our dev version (never @stable): a newer Rust's new clippy lints must not turn CI red on
+# unchanged code. Upgrading Rust = bump this in every job, run clippy, fix. Users are unaffected (rust-version).
 jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.96.0"
           components: rustfmt
       - run: cargo fmt --all --check
 
@@ -24,8 +27,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.96.0"
           components: clippy
       - name: Install ALSA headers (cpal)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
@@ -42,7 +46,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
       - name: Install ALSA headers (cpal)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
@@ -58,7 +64,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
       - name: Install ALSA headers (cpal)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
       - uses: Swatinem/rust-cache@v2
