@@ -77,9 +77,9 @@ Add the crate:
 ```toml
 [dependencies]
 bevy = "0.20.0"
-bevy_voice_chat = "0.3"
+bevy_voice_chat = "0.3.0"
 # or, with the optional low-bandwidth Opus codec:
-# bevy_voice_chat = { version = "0.3", features = ["opus"] }
+# bevy_voice_chat = { version = "0.3.0", features = ["opus"] }
 ```
 
 An open-mic voice chat whose "network" is an echo: every frame you send comes straight back as
@@ -598,7 +598,7 @@ one machine).
 
 ```toml
 [dependencies]
-bevy_voice_chat = { version = "0.3", features = ["replicon"] }
+bevy_voice_chat = { version = "0.3.0", features = ["replicon"] }
 ```
 
 `VoiceRepliconPlugin` sends your frames as a client message (`VoiceUp`) on replicon's unreliable
@@ -664,7 +664,7 @@ on the `opus` cargo feature, then choose it in the config.
 
 ```toml
 [dependencies]
-bevy_voice_chat = { version = "0.3", features = ["opus"] }
+bevy_voice_chat = { version = "0.3.0", features = ["opus"] }
 ```
 
 ```rust
@@ -924,7 +924,7 @@ not change.
 
 cpal 0.17.3 is the version Bevy 0.20's own audio (rodio) uses, so a game has one cpal. Platforms:
 whatever cpal supports (Windows WASAPI, macOS CoreAudio, Linux ALSA; Linux builds need the ALSA
-development package, e.g. `libasound2-dev`). The web is not supported yet.
+development package, e.g. `libasound2-dev`). The web is not supported.
 
 ## Examples
 
@@ -957,11 +957,11 @@ that pass a header check, and every call runs inside `catch_unwind`, so a panic 
 an error (and a dropped decoder), not a crash. That cannot help a game built with
 `panic = "abort"`, and it cannot catch undefined behaviour.
 
-**Forward error correction, packet-loss tuning, DTX?** Not offered yet: the Opus library version
+**Forward error correction, packet-loss tuning, DTX?** Not offered: the Opus library version
 this crate uses cannot decode forward error correction, and its variable-bitrate and FEC modes
 do not behave as documented, so the crate sticks to constant bitrate (or a strict per-frame cap
 with `vbr: true`). DTX (sending nothing in silence) is covered by the voice activity gate and
-push-to-talk already. These settings may come in a later version.
+push-to-talk already.
 
 **Bandwidth for a host?** A listen-server host relays every talking voice to every other player
 and sends its own voice to everyone. With everybody talking at once (the worst case) that is
