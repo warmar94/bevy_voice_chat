@@ -1,9 +1,9 @@
 [package]
 name = "bevy_voice_chat"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
-# Bevy 0.19's own minimum.
-rust-version = "1.95"
+# Bevy 0.20's own minimum.
+rust-version = "1.97.1"
 description = "Game-agnostic, transport-agnostic voice chat for Bevy: capture, voice activity / push-to-talk, filter hooks, pure-Rust codecs (IMA-ADPCM, optional Opus), jitter buffers and proximity mixing."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/warmar94/bevy_voice_chat"
@@ -23,29 +23,29 @@ opus = ["dep:opus-rs"]
 replicon = ["dep:bevy_replicon", "dep:bevy_state"]
 
 # Bevy is pinned EXACTLY and only its sub-crates are used, without default features: the crate adds
-# no Bevy feature a game did not ask for, and a game on Bevy 0.19.0 ends up with ONE Bevy.
+# no Bevy feature a game did not ask for, and a game on Bevy 0.20.0 ends up with ONE Bevy.
 [dependencies]
-bevy_app = { version = "=0.19.0", default-features = false, features = ["std"] }
-bevy_ecs = { version = "=0.19.0", default-features = false, features = ["std"] }
-bevy_math = { version = "=0.19.0", default-features = false, features = ["std"] }
-bevy_time = { version = "=0.19.0", default-features = false, features = ["std"] }
-bevy_transform = { version = "=0.19.0", default-features = false, features = ["std", "bevy-support"] }
+bevy_app = { version = "=0.20.0", default-features = false, features = ["std"] }
+bevy_ecs = { version = "=0.20.0", default-features = false, features = ["std"] }
+bevy_math = { version = "=0.20.0", default-features = false, features = ["std"] }
+bevy_time = { version = "=0.20.0", default-features = false, features = ["std"] }
+bevy_transform = { version = "=0.20.0", default-features = false, features = ["std", "bevy-support"] }
 # Bevy's logging goes through `tracing`; its subscriber (LogPlugin) picks these warnings up.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 serde = { version = "1.0.228", features = ["derive"] }
-# The version Bevy 0.19's audio stack (rodio 0.22) uses -> one cpal in a game's tree.
+# The version Bevy 0.20's audio stack (rodio 0.22) uses -> one cpal in a game's tree.
 cpal = { version = "=0.17.3" }
-bevy_replicon = { version = "=0.44.2", default-features = false, features = ["client", "server"], optional = true }
+bevy_replicon = { version = "=0.45.2", default-features = false, features = ["client", "server"], optional = true }
 # Pure Rust, zero dependencies, BSD-3-Clause. Pinned EXACTLY: its VBR / FEC behaviour is worked
 # around in `codec::Opus`, so a bump is a deliberate change (re-run the Opus tests). `heap` MUST stay
 # on: without it the codec state (~250 KB / ~175 KB) is stored inline and overflows small stacks.
 opus-rs = { version = "=0.1.34", default-features = false, features = ["std", "heap"], optional = true }
 # `in_state` run conditions for the replicon transport (replicon itself already needs bevy_state).
-bevy_state = { version = "=0.19.0", default-features = false, features = ["std"], optional = true }
+bevy_state = { version = "=0.20.0", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 # Tests + examples: MinimalPlugins / a headless DefaultPlugins (no window, no renderer).
-bevy = { version = "=0.19.0", default-features = false, features = ["std", "bevy_log", "bevy_state", "keyboard"] }
+bevy = { version = "=0.20.0", default-features = false, features = ["std", "bevy_log", "bevy_state", "keyboard"] }
 ron = "0.12.1"
 
 [package.metadata.docs.rs]

@@ -4,9 +4,9 @@
 [![docs.rs](https://img.shields.io/docsrs/bevy_voice_chat)](https://docs.rs/bevy_voice_chat)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![CI](https://github.com/warmar94/bevy_voice_chat/actions/workflows/ci.yml/badge.svg)](https://github.com/warmar94/bevy_voice_chat/actions/workflows/ci.yml)
-[![Bevy 0.19.0](https://img.shields.io/badge/Bevy-0.19.0-informational)](https://bevyengine.org)
+[![Bevy 0.20.0](https://img.shields.io/badge/Bevy-0.20.0-informational)](https://bevyengine.org)
 [![cpal 0.17.3](https://img.shields.io/badge/cpal-0.17.3-informational)](https://crates.io/crates/cpal)
-[![bevy_replicon 0.44.2 (optional)](https://img.shields.io/badge/bevy__replicon-0.44.2%20(optional)-informational)](https://crates.io/crates/bevy_replicon)
+[![bevy_replicon 0.45.2 (optional)](https://img.shields.io/badge/bevy__replicon-0.45.2%20(optional)-informational)](https://crates.io/crates/bevy_replicon)
 [![opus-rs 0.1.34 (optional)](https://img.shields.io/badge/opus--rs-0.1.34%20(optional)-informational)](https://crates.io/crates/opus-rs)
 
 Game-agnostic, transport-agnostic **voice chat for [Bevy](https://bevyengine.org)**: microphone
@@ -76,10 +76,10 @@ Add the crate:
 
 ```toml
 [dependencies]
-bevy = "0.19.0"
-bevy_voice_chat = "0.2"
+bevy = "0.20.0"
+bevy_voice_chat = "0.3"
 # or, with the optional low-bandwidth Opus codec:
-# bevy_voice_chat = { version = "0.2", features = ["opus"] }
+# bevy_voice_chat = { version = "0.3", features = ["opus"] }
 ```
 
 An open-mic voice chat whose "network" is an echo: every frame you send comes straight back as
@@ -598,7 +598,7 @@ one machine).
 
 ```toml
 [dependencies]
-bevy_voice_chat = { version = "0.2", features = ["replicon"] }
+bevy_voice_chat = { version = "0.3", features = ["replicon"] }
 ```
 
 `VoiceRepliconPlugin` sends your frames as a client message (`VoiceUp`) on replicon's unreliable
@@ -664,7 +664,7 @@ on the `opus` cargo feature, then choose it in the config.
 
 ```toml
 [dependencies]
-bevy_voice_chat = { version = "0.2", features = ["opus"] }
+bevy_voice_chat = { version = "0.3", features = ["opus"] }
 ```
 
 ```rust
@@ -904,7 +904,7 @@ The full documentation is generated with `cargo doc --open --all-features`. Ever
 | feature | default | what it adds |
 |---|---|---|
 | `opus` | no | the Opus codec ([section 13](#13-choosing-a-codec-adpcm-or-opus)) via `opus-rs` 0.1.34: pure Rust, no build script, no dependencies of its own, BSD-3-Clause (see [License](#license)) |
-| `replicon` | no | `VoiceRepliconPlugin` over `bevy_replicon` 0.44.2 (+ `bevy_state` for its run conditions) |
+| `replicon` | no | `VoiceRepliconPlugin` over `bevy_replicon` 0.45.2 (+ `bevy_state` for its run conditions) |
 
 Without features the crate depends on Bevy's `bevy_app`, `bevy_ecs`, `bevy_math`, `bevy_time`,
 `bevy_transform` (all without default features), `cpal`, `serde` and `tracing`. Without `opus`
@@ -915,13 +915,14 @@ encode or play it.
 
 | bevy_voice_chat | Bevy | cpal | bevy_replicon (optional) | opus-rs (optional) | Rust |
 |---|---|---|---|---|---|
+| 0.3 | 0.20.0 | 0.17.3 | 0.45.2 | 0.1.34 | 1.97.1+ |
 | 0.2 | 0.19.0 | 0.17.3 | 0.44.2 | 0.1.34 | 1.95+ |
 | 0.1 | 0.19.0 | 0.17.3 | 0.44.2 | - | 1.95+ |
 
 A default (IMA-ADPCM) 0.2 player and a 0.1 player hear each other: the IMA-ADPCM wire format did
 not change.
 
-cpal 0.17.3 is the version Bevy 0.19's own audio (rodio) uses, so a game has one cpal. Platforms:
+cpal 0.17.3 is the version Bevy 0.20's own audio (rodio) uses, so a game has one cpal. Platforms:
 whatever cpal supports (Windows WASAPI, macOS CoreAudio, Linux ALSA; Linux builds need the ALSA
 development package, e.g. `libasound2-dev`). The web is not supported yet.
 

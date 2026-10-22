@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (before 1.0, a breaking
 change or a Bevy / key dependency bump raises the minor version).
 
+## [0.3.0] - Unreleased
+
+Bevy 0.20 release. No API or behaviour changes.
+
+### Changed
+
+- Bevy 0.20.0 (was 0.19.0); feature `replicon`: bevy_replicon 0.45.2 (was 0.44.2). Rust 1.97.1+
+  (Bevy 0.20's minimum). cpal stays at 0.17.3, still the version Bevy 0.20's audio (rodio 0.22)
+  uses.
+
 ## [0.2.1] - 2026-09-29
 
 Device labels, for Bevy 0.19.0, cpal 0.17.3 and opus-rs 0.1.34. The public API is unchanged.
